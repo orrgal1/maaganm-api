@@ -300,18 +300,24 @@ async def set_authorized_user(
     )
     return SetAuthorizedUserResponse(**result)
 
+@app.get("/reports/catalog", response_model=ReportTypesResponse)
 @app.get("/reports/types", response_model=ReportTypesResponse)
-async def get_report_types():
+async def get_report_catalog():
     """
-    GET /reports/types
-    Returns catalogue of available budget reports with their parameter specifications.
+    GET /reports/catalog (or /reports/types)
+    Returns the complete catalog of available Kibbutz reports, including machine-readable slugs
+    (e.g. 'personal_budget', 'kolbo', 'water', 'electricity'), expected parameters, and sample URLs.
     """
     types = budget_driver.get_report_types()
-    return ReportTypesResponse(reports=[ReportTypeItem(**t) for t in types])
+    return ReportTypesResponse(
+        reports=[ReportTypeItem(**t) for t in types],
+        total=len(types)
+    )
 
-@app.get("/reports/generate")
+@app.get("/reports/generate", response_model=ReportDataResponse)
 async def generate_report(
-    report_id: int = Query(1, description="Report numeric ID (see /reports/types)"),
+    report: Optional[str] = Query("personal_budget", description="Report slug (e.g. 'personal_budget', 'kolbo', 'water') or numeric ID (e.g. 1, 5)"),
+    report_id: Optional[int] = Query(None, description="Legacy report numeric ID (deprecated, use 'report')"),
     format: str = Query("json", description="Output format: 'json', 'csv', 'pdf', or 'xls'"),
     year: Optional[int] = Query(None, description="Year for monthly reports (e.g. 2026)"),
     from_month: Optional[int] = Query(None, description="Starting month (1-12)"),
@@ -323,13 +329,15 @@ async def generate_report(
     """
     GET /reports/generate
     Generates and exports reports from budget.mmm.org.il.
-    When format='json', returns structured summary and line items.
-    When format='csv', 'pdf', or 'xls', returns the binary download.
+    Accepts machine-readable slug (e.g. report='personal_budget', report='kolbo', report='water') or numeric ID.
+    When format='json', returns structured summary and itemized line items.
+    When format='csv', 'pdf', or 'xls', returns binary file download.
     """
+    target_report = report_id if report_id is not None else (report or "personal_budget")
     data, media_type = await budget_driver.generate_report(
         username=creds.username,
         password=creds.password,
-        report_id=report_id,
+        report=target_report,
         format=format.lower(),
         year=year,
         from_month=from_month,
@@ -341,7 +349,7 @@ async def generate_report(
     if format.lower() == "json":
         return JSONResponse(content=data)
 
-    filename = f"report_{report_id}_{format}.{format}"
+    filename = f"report_{target_report}_{format}.{format}"
     return Response(
         content=data,
         media_type=media_type,

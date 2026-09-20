@@ -201,34 +201,39 @@ async def test_authorized_users(auth_headers):
         assert put_data["is_authorized"] is True
 
 @pytest.mark.asyncio
-async def test_reports_types(auth_headers):
+async def test_reports_catalog(auth_headers):
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as client:
-        resp = await client.get("/reports/types", headers=auth_headers)
+        resp = await client.get("/reports/catalog", headers=auth_headers)
         assert resp.status_code == 200
         data = resp.json()
         assert "reports" in data
-        assert len(data["reports"]) >= 10
+        assert data["total"] >= 20
         first = data["reports"][0]
         assert first["id"] == 1
+        assert first["slug"] == "personal_budget"
         assert first["name"] == "תקציב אישי"
+        assert "example_query" in first
 
 @pytest.mark.asyncio
-async def test_reports_generate_json(auth_headers):
+async def test_reports_generate_by_slug(auth_headers):
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as client:
-        resp = await client.get("/reports/generate?report_id=1&format=json&year=2026&from_month=1&to_month=8", headers=auth_headers)
+        resp = await client.get("/reports/generate?report=personal_budget&format=json&year=2026&from_month=1&to_month=8", headers=auth_headers)
         assert resp.status_code == 200
         data = resp.json()
         assert data["report_id"] == 1
+        assert data["report_slug"] == "personal_budget"
         assert "summary" in data
         assert "items" in data
         assert len(data["items"]) >= 1
 
 @pytest.mark.asyncio
-async def test_reports_generate_csv(auth_headers):
+async def test_reports_invalid_slug(auth_headers):
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as client:
-        resp = await client.get("/reports/generate?report_id=1&format=csv&year=2026", headers=auth_headers)
-        assert resp.status_code == 200
-        assert "text/csv" in resp.headers["content-type"]
+        resp = await client.get("/reports/generate?report=non_existent_report", headers=auth_headers)
+        assert resp.status_code == 400
+        data = resp.json()
+        assert data["error"]["code"] == "invalid_report_id"
+        assert "Available options" in data["error"]["message"]

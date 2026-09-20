@@ -112,12 +112,16 @@ class ErrorResponse(BaseModel):
 
 class ReportTypeItem(BaseModel):
     id: int = Field(..., description="Report numeric ID")
+    slug: str = Field(..., description="Machine-readable unique key (e.g. 'personal_budget', 'kolbo', 'water')")
     name: str = Field(..., description="Hebrew name of the report")
     description: str = Field(..., description="English description of the report content")
     parameter_type: str = Field(..., description="'monthly' (Year/FromMonth/ToMonth), 'date_range' (FromDate/ToDate), or 'none'")
+    required_parameters: List[str] = Field(default_factory=list, description="List of expected query parameters")
+    example_query: str = Field(..., description="Example URL query to generate this report")
 
 class ReportTypesResponse(BaseModel):
     reports: List[ReportTypeItem] = Field(default_factory=list)
+    total: int = Field(..., description="Total available report types")
 
 class ReportLineItem(BaseModel):
     date: Optional[str] = Field(None, description="Transaction date")
@@ -137,6 +141,7 @@ class ReportSummary(BaseModel):
 
 class ReportDataResponse(BaseModel):
     report_id: int
+    report_slug: str
     report_name: str
     period: str
     summary: Optional[ReportSummary] = None

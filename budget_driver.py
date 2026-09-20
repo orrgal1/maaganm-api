@@ -17,27 +17,195 @@ from idempotency import pending_transfer_store
 logger = logging.getLogger("budget_driver")
 
 REPORT_DEFINITIONS = [
-    {"id": 1, "name": "תקציב אישי", "description": "Personal monthly budget statement", "parameter_type": "monthly"},
-    {"id": 2, "name": "חיובי נסיעות סדרנט", "description": "SederNet vehicle travel charges", "parameter_type": "date_range"},
-    {"id": 3, "name": "קניות חדר אוכל לפי קונה", "description": "Dining room meal charges grouped by buyer", "parameter_type": "date_range"},
-    {"id": 4, "name": "קניות חדר אוכל לפי תאריך", "description": "Dining room meal charges grouped by date", "parameter_type": "date_range"},
-    {"id": 5, "name": "קניות כולבו", "description": "Kolbo supermarket itemized purchases", "parameter_type": "date_range"},
-    {"id": 6, "name": "קניות מרכולית", "description": "Makolit grocery purchases", "parameter_type": "date_range"},
-    {"id": 7, "name": "קניות מחנויות", "description": "Local branch store charges", "parameter_type": "date_range"},
-    {"id": 8, "name": "רפואה משלימה", "description": "Complementary medicine treatments", "parameter_type": "date_range"},
-    {"id": 9, "name": "העברות בין תקציבים", "description": "Inter-budget member transfers history", "parameter_type": "date_range"},
-    {"id": 10, "name": "תמחיר עובדי חוץ", "description": "Outside employment costing", "parameter_type": "date_range"},
-    {"id": 11, "name": "דוח עובדי חוץ", "description": "Outside employment statement", "parameter_type": "date_range"},
-    {"id": 12, "name": "דוח סטודנטים", "description": "Student expenses and stipends", "parameter_type": "date_range"},
-    {"id": 13, "name": "תקציב לימודים", "description": "Higher education budget", "parameter_type": "date_range"},
-    {"id": 14, "name": "חיובי תרופות", "description": "Pharmacy & prescription charges", "parameter_type": "date_range"},
-    {"id": 16, "name": "חיובי חשמל חברים", "description": "Residential electricity meter charges", "parameter_type": "date_range"},
-    {"id": 17, "name": "חיובי משקפיים", "description": "Eyeglasses and optical subsidies", "parameter_type": "date_range"},
-    {"id": 18, "name": "חוגים", "description": "Community sports & hobby classes", "parameter_type": "date_range"},
-    {"id": 26, "name": "קניות פאב לפי קונה", "description": "Kibbutz pub purchases grouped by buyer", "parameter_type": "date_range"},
-    {"id": 27, "name": "קניות פאב לפי תאריך", "description": "Kibbutz pub purchases grouped by date", "parameter_type": "date_range"},
-    {"id": 69, "name": "כרטסת תושבים", "description": "Resident ledger card", "parameter_type": "date_range"},
-    {"id": 90, "name": "פירוט צריכת מים", "description": "Residential water consumption", "parameter_type": "none"}
+    {
+        "id": 1,
+        "slug": "personal_budget",
+        "name": "תקציב אישי",
+        "description": "Personal monthly budget statement with allowances, expenses, and closing balance",
+        "parameter_type": "monthly",
+        "required_parameters": ["year", "from_month", "to_month"],
+        "example_query": "/reports/generate?report=personal_budget&format=json&year=2026&from_month=1&to_month=8"
+    },
+    {
+        "id": 2,
+        "slug": "travel_sedernet",
+        "name": "חיובי נסיעות סדרנט",
+        "description": "SederNet vehicle travel charges and mileage",
+        "parameter_type": "date_range",
+        "required_parameters": ["from_date", "to_date"],
+        "example_query": "/reports/generate?report=travel_sedernet&format=json&from_date=01/01/2026&to_date=20/09/2026"
+    },
+    {
+        "id": 3,
+        "slug": "dining_room_by_buyer",
+        "name": "קניות חדר אוכל לפי קונה",
+        "description": "Dining room meal charges itemized by family member / buyer",
+        "parameter_type": "date_range",
+        "required_parameters": ["from_date", "to_date"],
+        "example_query": "/reports/generate?report=dining_room_by_buyer&format=json&from_date=01/01/2026&to_date=20/09/2026"
+    },
+    {
+        "id": 4,
+        "slug": "dining_room_by_date",
+        "name": "קניות חדר אוכל לפי תאריך",
+        "description": "Dining room meal charges itemized chronologically by date",
+        "parameter_type": "date_range",
+        "required_parameters": ["from_date", "to_date"],
+        "example_query": "/reports/generate?report=dining_room_by_date&format=json&from_date=01/01/2026&to_date=20/09/2026"
+    },
+    {
+        "id": 5,
+        "slug": "kolbo",
+        "name": "קניות כולבו",
+        "description": "Kolbo supermarket grocery and household itemized purchases",
+        "parameter_type": "date_range",
+        "required_parameters": ["from_date", "to_date"],
+        "example_query": "/reports/generate?report=kolbo&format=json&from_date=01/08/2026&to_date=31/08/2026"
+    },
+    {
+        "id": 6,
+        "slug": "makolit",
+        "name": "קניות מרכולית",
+        "description": "Makolit local convenience store grocery purchases",
+        "parameter_type": "date_range",
+        "required_parameters": ["from_date", "to_date"],
+        "example_query": "/reports/generate?report=makolit&format=json&from_date=01/08/2026&to_date=31/08/2026"
+    },
+    {
+        "id": 7,
+        "slug": "stores",
+        "name": "קניות מחנויות",
+        "description": "Local kibbutz branch store charges",
+        "parameter_type": "date_range",
+        "required_parameters": ["from_date", "to_date"],
+        "example_query": "/reports/generate?report=stores&format=json&from_date=01/08/2026&to_date=31/08/2026"
+    },
+    {
+        "id": 8,
+        "slug": "complementary_medicine",
+        "name": "רפואה משלימה",
+        "description": "Complementary medicine treatments and wellness services",
+        "parameter_type": "date_range",
+        "required_parameters": ["from_date", "to_date"],
+        "example_query": "/reports/generate?report=complementary_medicine&format=json&from_date=01/01/2026&to_date=20/09/2026"
+    },
+    {
+        "id": 9,
+        "slug": "budget_transfers",
+        "name": "העברות בין תקציבים",
+        "description": "Inter-budget transfers history between members",
+        "parameter_type": "date_range",
+        "required_parameters": ["from_date", "to_date"],
+        "example_query": "/reports/generate?report=budget_transfers&format=json&from_date=01/01/2026&to_date=20/09/2026"
+    },
+    {
+        "id": 10,
+        "slug": "outside_workers_costing",
+        "name": "תמחיר עובדי חוץ",
+        "description": "Outside employment costing analysis",
+        "parameter_type": "date_range",
+        "required_parameters": ["from_date", "to_date"],
+        "example_query": "/reports/generate?report=outside_workers_costing&format=json&from_date=01/01/2026&to_date=20/09/2026"
+    },
+    {
+        "id": 11,
+        "slug": "outside_workers",
+        "name": "דוח עובדי חוץ",
+        "description": "Outside employment statements and income records",
+        "parameter_type": "date_range",
+        "required_parameters": ["from_date", "to_date"],
+        "example_query": "/reports/generate?report=outside_workers&format=json&from_date=01/01/2026&to_date=20/09/2026"
+    },
+    {
+        "id": 12,
+        "slug": "students",
+        "name": "דוח סטודנטים",
+        "description": "Higher education student expenses and allowances",
+        "parameter_type": "date_range",
+        "required_parameters": ["from_date", "to_date"],
+        "example_query": "/reports/generate?report=students&format=json&from_date=01/01/2026&to_date=20/09/2026"
+    },
+    {
+        "id": 13,
+        "slug": "studies_budget",
+        "name": "תקציב לימודים",
+        "description": "Educational development budget statement",
+        "parameter_type": "date_range",
+        "required_parameters": ["from_date", "to_date"],
+        "example_query": "/reports/generate?report=studies_budget&format=json&from_date=01/01/2026&to_date=20/09/2026"
+    },
+    {
+        "id": 14,
+        "slug": "pharmacy",
+        "name": "חיובי תרופות",
+        "description": "Pharmacy & prescription medical charges",
+        "parameter_type": "date_range",
+        "required_parameters": ["from_date", "to_date"],
+        "example_query": "/reports/generate?report=pharmacy&format=json&from_date=01/01/2026&to_date=20/09/2026"
+    },
+    {
+        "id": 16,
+        "slug": "electricity",
+        "name": "חיובי חשמל חברים",
+        "description": "Residential household electricity meter charges",
+        "parameter_type": "date_range",
+        "required_parameters": ["from_date", "to_date"],
+        "example_query": "/reports/generate?report=electricity&format=json&from_date=01/01/2026&to_date=20/09/2026"
+    },
+    {
+        "id": 17,
+        "slug": "eyeglasses",
+        "name": "חיובי משקפיים",
+        "description": "Eyeglasses and optical subsidies and charges",
+        "parameter_type": "date_range",
+        "required_parameters": ["from_date", "to_date"],
+        "example_query": "/reports/generate?report=eyeglasses&format=json&from_date=01/01/2026&to_date=20/09/2026"
+    },
+    {
+        "id": 18,
+        "slug": "classes",
+        "name": "חוגים",
+        "description": "Community sports, arts, and educational classes",
+        "parameter_type": "date_range",
+        "required_parameters": ["from_date", "to_date"],
+        "example_query": "/reports/generate?report=classes&format=json&from_date=01/01/2026&to_date=20/09/2026"
+    },
+    {
+        "id": 26,
+        "slug": "pub_by_buyer",
+        "name": "קניות פאב לפי קונה",
+        "description": "Kibbutz pub beverage and snack purchases by buyer",
+        "parameter_type": "date_range",
+        "required_parameters": ["from_date", "to_date"],
+        "example_query": "/reports/generate?report=pub_by_buyer&format=json&from_date=01/01/2026&to_date=20/09/2026"
+    },
+    {
+        "id": 27,
+        "slug": "pub_by_date",
+        "name": "קניות פאב לפי תאריך",
+        "description": "Kibbutz pub purchases chronologically by date",
+        "parameter_type": "date_range",
+        "required_parameters": ["from_date", "to_date"],
+        "example_query": "/reports/generate?report=pub_by_date&format=json&from_date=01/01/2026&to_date=20/09/2026"
+    },
+    {
+        "id": 69,
+        "slug": "residents_ledger",
+        "name": "כרטסת תושבים",
+        "description": "Resident accounting ledger card",
+        "parameter_type": "date_range",
+        "required_parameters": ["from_date", "to_date"],
+        "example_query": "/reports/generate?report=residents_ledger&format=json&from_date=01/01/2026&to_date=20/09/2026"
+    },
+    {
+        "id": 90,
+        "slug": "water",
+        "name": "פירוט צריכת מים",
+        "description": "Residential water meter consumption statement",
+        "parameter_type": "none",
+        "required_parameters": [],
+        "example_query": "/reports/generate?report=water&format=json"
+    }
 ]
 
 class BudgetDriver:
@@ -552,11 +720,33 @@ class BudgetDriver:
         """Returns catalogue of supported report types and their required parameters."""
         return REPORT_DEFINITIONS
 
+    def resolve_report(self, report_identifier: Any) -> Dict[str, Any]:
+        """
+        Resolves report by numeric ID (e.g. 1, 5) or slug (e.g. 'personal_budget', 'kolbo').
+        """
+        rep = None
+        s_id = str(report_identifier).strip()
+        if s_id.isdigit():
+            num_id = int(s_id)
+            rep = next((r for r in REPORT_DEFINITIONS if r["id"] == num_id), None)
+        else:
+            slug_norm = s_id.lower()
+            rep = next((r for r in REPORT_DEFINITIONS if r["slug"] == slug_norm), None)
+
+        if not rep:
+            valid_options = ", ".join([f"'{r['slug']}' ({r['id']})" for r in REPORT_DEFINITIONS])
+            raise APIException(
+                status_code=400,
+                code="invalid_report_id",
+                message=f"Unknown report identifier '{report_identifier}'. Available options: {valid_options}"
+            )
+        return rep
+
     async def generate_report(
         self,
         username: str,
         password: str,
-        report_id: int,
+        report: Any,
         format: str = "json",
         year: Optional[int] = None,
         from_month: Optional[int] = None,
@@ -566,11 +756,14 @@ class BudgetDriver:
     ) -> Tuple[Any, str]:
         """
         Generates report from /Reports/Report.
+        Accepts either numeric report ID (e.g. 1) or string slug (e.g. 'personal_budget').
         Returns (result_data, content_type).
         """
-        rep_def = next((r for r in REPORT_DEFINITIONS if r["id"] == report_id), None)
-        rep_name = rep_def["name"] if rep_def else f"Report {report_id}"
-        param_type = rep_def["parameter_type"] if rep_def else "monthly"
+        rep_def = self.resolve_report(report)
+        report_id = rep_def["id"]
+        report_slug = rep_def["slug"]
+        rep_name = rep_def["name"]
+        param_type = rep_def["parameter_type"]
 
         now = datetime.now()
         cur_year = year or now.year
@@ -603,6 +796,7 @@ class BudgetDriver:
                 ]
                 return {
                     "report_id": report_id,
+                    "report_slug": report_slug,
                     "report_name": rep_name,
                     "period": f"{f_month}/{cur_year} - {t_month}/{cur_year}" if param_type == "monthly" else f"{f_date} - {t_date}",
                     "summary": {
@@ -751,6 +945,7 @@ class BudgetDriver:
         period_desc = f"{f_month}/{cur_year} - {t_month}/{cur_year}" if param_type == "monthly" else f"{f_date} - {t_date}"
         return {
             "report_id": report_id,
+            "report_slug": report_slug,
             "report_name": rep_name,
             "period": period_desc,
             "summary": summary,

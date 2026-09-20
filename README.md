@@ -165,28 +165,57 @@ curl -X PUT http://127.0.0.1:8001/account/authorized-users \
   }'
 ```
 
-### 11. List Available Report Types
+### 11. Discover Reports Catalog
 ```bash
-curl -X GET http://127.0.0.1:8001/reports/types \
+curl -X GET http://127.0.0.1:8001/reports/catalog \
   -H "Authorization: Bearer $JWT"
 ```
-Returns all 20+ available Kibbutz reports (Personal budget, Kolbo supermarket, Dining room meals, Electricity, Water consumption, etc.) and their required parameter types (`monthly`, `date_range`, or `none`).
+Returns the full catalog of all 21 available Kibbutz reports with their machine-readable **slugs**, descriptions, expected parameters, and copy-paste sample queries:
+
+| Slug | ID | Name | Parameters |
+|---|---|---|---|
+| `personal_budget` | 1 | תקציב אישי | `year`, `from_month`, `to_month` |
+| `travel_sedernet` | 2 | חיובי נסיעות סדרנט | `from_date`, `to_date` |
+| `dining_room_by_buyer` | 3 | קניות חדר אוכל לפי קונה | `from_date`, `to_date` |
+| `dining_room_by_date` | 4 | קניות חדר אוכל לפי תאריך | `from_date`, `to_date` |
+| `kolbo` | 5 | קניות כולבו | `from_date`, `to_date` |
+| `makolit` | 6 | קניות מרכולית | `from_date`, `to_date` |
+| `stores` | 7 | קניות מחנויות | `from_date`, `to_date` |
+| `complementary_medicine` | 8 | רפואה משלימה | `from_date`, `to_date` |
+| `budget_transfers` | 9 | העברות בין תקציבים | `from_date`, `to_date` |
+| `outside_workers_costing` | 10 | תמחיר עובדי חוץ | `from_date`, `to_date` |
+| `outside_workers` | 11 | דוח עובדי חוץ | `from_date`, `to_date` |
+| `students` | 12 | דוח סטודנטים | `from_date`, `to_date` |
+| `studies_budget` | 13 | תקציב לימודים | `from_date`, `to_date` |
+| `pharmacy` | 14 | חיובי תרופות | `from_date`, `to_date` |
+| `electricity` | 16 | חיובי חשמל חברים | `from_date`, `to_date` |
+| `eyeglasses` | 17 | חיובי משקפיים | `from_date`, `to_date` |
+| `classes` | 18 | חוגים | `from_date`, `to_date` |
+| `pub_by_buyer` | 26 | קניות פאב לפי קונה | `from_date`, `to_date` |
+| `pub_by_date` | 27 | קניות פאב לפי תאריך | `from_date`, `to_date` |
+| `residents_ledger` | 69 | כרטסת תושבים | `from_date`, `to_date` |
+| `water` | 90 | פירוט צריכת מים | *(none)* |
 
 ### 12. Generate and View Reports (JSON or PDF/CSV Export)
+Accepts either human/machine-readable **slugs** (recommended) or numeric IDs:
+
 ```bash
-# View personal monthly budget report as structured JSON with line items and balance totals
-curl -X GET "http://127.0.0.1:8001/reports/generate?report_id=1&format=json&year=2026&from_month=8&to_month=8" \
+# 1. View personal budget as structured JSON (using slug 'personal_budget')
+curl -X GET "http://127.0.0.1:8001/reports/generate?report=personal_budget&format=json&year=2026&from_month=8&to_month=8" \
   -H "Authorization: Bearer $JWT"
 
-# Download official PDF statement
-curl -X GET "http://127.0.0.1:8001/reports/generate?report_id=1&format=pdf&year=2026&from_month=8&to_month=8" \
+# 2. Download official PDF statement
+curl -X GET "http://127.0.0.1:8001/reports/generate?report=personal_budget&format=pdf&year=2026&from_month=8&to_month=8" \
   -H "Authorization: Bearer $JWT" \
   -o budget_report_08_2026.pdf
 
-# Download Kolbo supermarket itemized charges as CSV
-curl -X GET "http://127.0.0.1:8001/reports/generate?report_id=5&format=csv&from_date=01/08/2026&to_date=31/08/2026" \
-  -H "Authorization: Bearer $JWT" \
-  -o kolbo_charges.csv
+# 3. View Kolbo supermarket itemized charges (using slug 'kolbo')
+curl -X GET "http://127.0.0.1:8001/reports/generate?report=kolbo&format=json&from_date=01/08/2026&to_date=31/08/2026" \
+  -H "Authorization: Bearer $JWT"
+
+# 4. View Water consumption report (using slug 'water')
+curl -X GET "http://127.0.0.1:8001/reports/generate?report=water&format=json" \
+  -H "Authorization: Bearer $JWT"
 ```
 
 ---
