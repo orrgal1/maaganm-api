@@ -10,3 +10,4 @@ __pycache__/
 .current_jwt
 feedback.jsonl
 .DS_Store
+poll_github.py
