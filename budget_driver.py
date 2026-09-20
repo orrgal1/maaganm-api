@@ -1,6 +1,9 @@
 import asyncio
 import logging
 import re
+import csv
+import io
+import time
 import urllib.parse
 from datetime import datetime, timedelta
 from typing import Optional, Dict, Any, List, Tuple
@@ -13,6 +16,30 @@ from idempotency import pending_transfer_store
 
 logger = logging.getLogger("budget_driver")
 
+REPORT_DEFINITIONS = [
+    {"id": 1, "name": "תקציב אישי", "description": "Personal monthly budget statement", "parameter_type": "monthly"},
+    {"id": 2, "name": "חיובי נסיעות סדרנט", "description": "SederNet vehicle travel charges", "parameter_type": "date_range"},
+    {"id": 3, "name": "קניות חדר אוכל לפי קונה", "description": "Dining room meal charges grouped by buyer", "parameter_type": "date_range"},
+    {"id": 4, "name": "קניות חדר אוכל לפי תאריך", "description": "Dining room meal charges grouped by date", "parameter_type": "date_range"},
+    {"id": 5, "name": "קניות כולבו", "description": "Kolbo supermarket itemized purchases", "parameter_type": "date_range"},
+    {"id": 6, "name": "קניות מרכולית", "description": "Makolit grocery purchases", "parameter_type": "date_range"},
+    {"id": 7, "name": "קניות מחנויות", "description": "Local branch store charges", "parameter_type": "date_range"},
+    {"id": 8, "name": "רפואה משלימה", "description": "Complementary medicine treatments", "parameter_type": "date_range"},
+    {"id": 9, "name": "העברות בין תקציבים", "description": "Inter-budget member transfers history", "parameter_type": "date_range"},
+    {"id": 10, "name": "תמחיר עובדי חוץ", "description": "Outside employment costing", "parameter_type": "date_range"},
+    {"id": 11, "name": "דוח עובדי חוץ", "description": "Outside employment statement", "parameter_type": "date_range"},
+    {"id": 12, "name": "דוח סטודנטים", "description": "Student expenses and stipends", "parameter_type": "date_range"},
+    {"id": 13, "name": "תקציב לימודים", "description": "Higher education budget", "parameter_type": "date_range"},
+    {"id": 14, "name": "חיובי תרופות", "description": "Pharmacy & prescription charges", "parameter_type": "date_range"},
+    {"id": 16, "name": "חיובי חשמל חברים", "description": "Residential electricity meter charges", "parameter_type": "date_range"},
+    {"id": 17, "name": "חיובי משקפיים", "description": "Eyeglasses and optical subsidies", "parameter_type": "date_range"},
+    {"id": 18, "name": "חוגים", "description": "Community sports & hobby classes", "parameter_type": "date_range"},
+    {"id": 26, "name": "קניות פאב לפי קונה", "description": "Kibbutz pub purchases grouped by buyer", "parameter_type": "date_range"},
+    {"id": 27, "name": "קניות פאב לפי תאריך", "description": "Kibbutz pub purchases grouped by date", "parameter_type": "date_range"},
+    {"id": 69, "name": "כרטסת תושבים", "description": "Resident ledger card", "parameter_type": "date_range"},
+    {"id": 90, "name": "פירוט צריכת מים", "description": "Residential water consumption", "parameter_type": "none"}
+]
+
 class BudgetDriver:
     """
     Async HTTP client driver for https://budget.mmm.org.il/.
@@ -23,12 +50,14 @@ class BudgetDriver:
     def __init__(self):
         self._clients: Dict[str, httpx.AsyncClient] = {}
         self._lock = asyncio.Lock()
+        self._recipients_cache: Dict[str, Tuple[float, List[Dict[str, Any]]]] = {}
 
         # In-memory mock database for mock mode
         self._mock_users = {
             "mock_user": {
                 "user_id": "80241",
                 "name": "ישראל ישראלי",
+                "phone": "050-1234567",
                 "budget_balance": 1850.40,
                 "savings_balance": 24000.00
             }
@@ -91,7 +120,7 @@ class BudgetDriver:
             if client is None or client.is_closed:
                 client = httpx.AsyncClient(
                     base_url=config.BUDGET_BASE_URL,
-                    timeout=30.0,
+                    timeout=35.0,
                     follow_redirects=True,
                     headers={
                         "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
@@ -149,17 +178,19 @@ class BudgetDriver:
             return False, None
 
     async def get_balance(self, username: str, password: str) -> Dict[str, Any]:
-        """Fetches current budget balance and savings balance."""
+        """Fetches current budget balance, savings balance, and registered OTP phone."""
         if config.MOCK_MODE:
             user_data = self._mock_users.get(username, {
                 "user_id": username,
-                "name": "חבר קיבוץ",
-                "budget_balance": 1500.00,
-                "savings_balance": 10000.00
+                "name": "ישראל ישראלי",
+                "phone": "050-1234567",
+                "budget_balance": 1850.40,
+                "savings_balance": 24000.00
             })
             return {
                 "budget_balance_ils": user_data["budget_balance"],
                 "savings_balance_ils": user_data.get("savings_balance"),
+                "phone_for_otp": user_data.get("phone"),
                 "user_name": user_data.get("name"),
                 "user_id": user_data.get("user_id")
             }
@@ -174,37 +205,45 @@ class BudgetDriver:
             )
 
         soup = BeautifulSoup(resp.text, "html.parser")
-        
-        # Parse balances from page
         budget_balance = 0.0
-        savings_balance = None
+        savings_balance = 0.0
+        phone_for_otp = None
         user_name = None
 
-        # Look for balance amounts in text/spans
-        # Usually displayed in warnings-container or balance labels
-        text = soup.get_text()
-        balance_match = re.search(r'יתרת(?:ך)?\s*בתקציב\s*[:=]?\s*([-\d,.]+)', text)
-        if balance_match:
-            try:
-                budget_balance = float(balance_match.group(1).replace(",", ""))
-            except ValueError:
-                pass
+        top_msg = soup.find(class_="top-message")
+        if top_msg:
+            top_text = top_msg.get_text()
+            phone_match = re.search(r'05\d-?\d{7}', top_text)
+            if phone_match:
+                phone_for_otp = phone_match.group(0)
 
-        savings_match = re.search(r'חיסכון\s*פרטי\s*[:=]?\s*([-\d,.]+)', text)
-        if savings_match:
-            try:
-                savings_balance = float(savings_match.group(1).replace(",", ""))
-            except ValueError:
-                pass
+            budget_match = re.search(r'יתרת תקציב היא:\s*₪?\s*([-\d,.]+)', top_text)
+            if budget_match:
+                try:
+                    budget_balance = float(budget_match.group(1).replace(",", ""))
+                except ValueError:
+                    pass
 
-        # Parse user name from header if available
-        header_h4 = soup.find("h4", class_="col-sm-2")
-        if header_h4 and header_h4.get_text(strip=True):
-            user_name = header_h4.get_text(strip=True)
+            savings_match = re.search(r'יתרת חסכונך היא:\s*₪?\s*([-\d,.]+)', top_text)
+            if savings_match:
+                try:
+                    savings_balance = float(savings_match.group(1).replace(",", ""))
+                except ValueError:
+                    pass
+
+        header_div = soup.find(class_="page-header")
+        if header_div:
+            # Contains e.g. "3850 orrgal@gmail.com"
+            for h in header_div.find_all(["h1", "h4", "div", "span"]):
+                txt = h.get_text(strip=True)
+                if "@" in txt or username in txt:
+                    user_name = txt
+                    break
 
         return {
             "budget_balance_ils": budget_balance,
             "savings_balance_ils": savings_balance,
+            "phone_for_otp": phone_for_otp,
             "user_name": user_name,
             "user_id": username
         }
@@ -225,41 +264,56 @@ class BudgetDriver:
                     results.append(u)
             return results
 
-        client = await self.get_client(username, password)
-        resp = await client.post(
-            "/Budget/GetUsers",
-            data={"transactionType": transaction_type}
-        )
-        if resp.status_code != 200:
-            raise APIException(
-                status_code=502,
-                code="upstream_error",
-                message=f"Failed to retrieve member list (HTTP {resp.status_code})"
+        # Check in-memory cache (TTL: 1 hour)
+        cache_key = f"recipients_{transaction_type}"
+        now_ts = time.time()
+        cached = self._recipients_cache.get(cache_key)
+        all_recipients = None
+
+        if cached and (now_ts - cached[0] < 3600):
+            all_recipients = cached[1]
+        else:
+            client = await self.get_client(username, password)
+            resp = await client.post(
+                "/Budget/GetUsers",
+                data={"transactionType": transaction_type}
             )
+            if resp.status_code != 200:
+                raise APIException(
+                    status_code=502,
+                    code="upstream_error",
+                    message=f"Failed to retrieve member list (HTTP {resp.status_code})"
+                )
 
-        soup = BeautifulSoup(resp.text, "html.parser")
-        recipients = []
+            soup = BeautifulSoup(resp.text, "html.parser")
+            table = soup.find("table")
+            all_recipients = []
+            if table:
+                rows = table.find_all("tr")
+                for r in rows:
+                    tds = r.find_all("td")
+                    if len(tds) >= 3:
+                        user_hid = tds[0].get_text(strip=True)
+                        sort_order = tds[1].get_text(strip=True)
+                        display_name = tds[2].get_text(strip=True)
+                        dept = tds[3].get_text(strip=True) if len(tds) > 3 else None
+                        all_recipients.append({
+                            "user_id": user_hid,
+                            "user_hid": user_hid,
+                            "display_name": display_name,
+                            "department": dept
+                        })
+            self._recipients_cache[cache_key] = (now_ts, all_recipients)
+
         q = query.strip().lower()
+        if not q:
+            return all_recipients[:50]
 
-        # Parse rows of member table
-        rows = soup.find_all("tr")
-        for row in rows:
-            tds = row.find_all("td")
-            if len(tds) >= 3:
-                user_id = tds[0].get_text(strip=True)
-                user_hid = tds[1].get_text(strip=True)
-                display_name = tds[2].get_text(strip=True)
-                dept = tds[3].get_text(strip=True) if len(tds) > 3 else None
-
-                if not q or (q in display_name.lower()) or (q in user_id):
-                    recipients.append({
-                        "user_id": user_id,
-                        "user_hid": user_hid or user_id,
-                        "display_name": display_name,
-                        "department": dept
-                    })
-
-        return recipients
+        filtered = [
+            r for r in all_recipients
+            if q in r["display_name"].lower() or q in r["user_hid"]
+        ]
+        return filtered
 
     async def get_transactions(
         self,
@@ -277,11 +331,11 @@ class BudgetDriver:
         now = datetime.now()
         f_date = from_date or (now - timedelta(days=90)).strftime("%d/%m/%Y")
         t_date = to_date or now.strftime("%d/%m/%Y")
-        t_types = types or "1,2,3,4"
+        t_types = types or "Regular,FromSavings,ToSavings,Charge,BulkCharge"
 
         client = await self.get_client(username, password)
         data_param = f"{f_date}¥{t_date}¥{t_types}"
-        resp = await client.get(f"/Budget/GetTransactionsTable?data={urllib.parse.quote(data_param)}")
+        resp = await client.get("/Budget/GetTransactionsTable", params={"data": data_param})
 
         if resp.status_code != 200:
             raise APIException(
@@ -290,34 +344,44 @@ class BudgetDriver:
                 message=f"Failed to fetch transactions table (HTTP {resp.status_code})"
             )
 
+        status_map = {
+            "Executed": "בוצע",
+            "Cancelled": "מבוטל",
+            "Approved": "מאושר",
+            "Unapproved": "ממתין לאישור",
+            "Declined": "נדחה",
+            "Delayed": "מעוכב"
+        }
+
         soup = BeautifulSoup(resp.text, "html.parser")
         transactions = []
         rows = soup.find_all("tr")
         for r in rows:
             tds = r.find_all("td")
-            if len(tds) >= 8:
+            if len(tds) >= 11:
                 trx_id = tds[0].get_text(strip=True)
                 disp_id = tds[1].get_text(strip=True)
                 date_str = tds[2].get_text(strip=True)
-                trx_type = tds[3].get_text(strip=True)
-                counterparty = tds[4].get_text(strip=True)
-                details = tds[5].get_text(strip=True)
+                sender = tds[3].get_text(strip=True)
+                receiver = tds[4].get_text(strip=True)
                 try:
-                    amount = float(tds[6].get_text(strip=True).replace(",", "").replace("₪", ""))
+                    amount = float(tds[5].get_text(strip=True).replace(",", "").replace("₪", ""))
                 except ValueError:
                     amount = 0.0
-                status_str = tds[7].get_text(strip=True)
-                
-                can_cancel = "True" in str(tds) or "ביטול" in str(tds)
-                can_approve = "thumbs-up" in str(tds)
+                sender_note = tds[6].get_text(strip=True)
+                receiver_note = tds[7].get_text(strip=True)
+                can_approve = tds[8].get_text(strip=True).lower() == "true"
+                can_cancel = tds[9].get_text(strip=True).lower() == "true"
+                raw_status = tds[10].get_text(strip=True)
+                status_str = status_map.get(raw_status, raw_status)
 
                 transactions.append({
                     "transaction_id": trx_id,
-                    "display_id": disp_id,
+                    "display_id": f"{disp_id}/{trx_id}" if disp_id else trx_id,
                     "date": date_str,
-                    "type": trx_type,
-                    "counterparty": counterparty,
-                    "details": details,
+                    "type": "העברה",
+                    "counterparty": receiver if sender == username or "גל אור" in sender else sender,
+                    "details": sender_note or receiver_note,
                     "amount_ils": amount,
                     "balance_ils": None,
                     "status": status_str,
@@ -341,7 +405,6 @@ class BudgetDriver:
         """Submits a money transfer to another member."""
         if config.MOCK_MODE:
             trx_id = f"TRX_{int(datetime.now().timestamp())}"
-            # Stage transfer in pending store awaiting OTP SMS
             pending_transfer_store.stage_transfer(
                 transaction_id=trx_id,
                 recipient_id=recipient_hid,
@@ -359,12 +422,14 @@ class BudgetDriver:
 
         client = await self.get_client(username, password)
         form_payload = {
-            "Transactions[0].Type": str(transaction_type),
-            "Transactions[0].ReceiverHID": recipient_hid,
+            "Transactions[0].Type": "Regular",
             "Transactions[0].ReceiverDisplayName": recipient_name,
+            "Transactions[0].ReceiverHID": recipient_hid,
+            "Transactions[0].CurCode": "0",
+            "Transactions[0].TrnsTypeId": "0",
             "Transactions[0].Amount": f"{amount_ils:.2f}",
-            "Transactions[0].DetailsForReceiver": details_receiver,
-            "Transactions[0].DetailsForSender": details_sender
+            "Transactions[0].DetailsForReceiver": details_receiver[:20] if details_receiver else "",
+            "Transactions[0].DetailsForSender": details_sender[:20] if details_sender else ""
         }
 
         resp = await client.post("/Budget/SendMoney", data=form_payload)
@@ -419,20 +484,6 @@ class BudgetDriver:
                     message=f"Pending transfer {transaction_id} not found or expired"
                 )
             pending_transfer_store.remove_transfer(transaction_id)
-            # Add to mock transactions
-            self._mock_transactions.insert(0, {
-                "transaction_id": transaction_id,
-                "display_id": f"REF/{transaction_id}",
-                "date": datetime.now().strftime("%d/%m/%Y"),
-                "type": "העברה רגילה",
-                "counterparty": pending["recipient_name"],
-                "details": pending["details_receiver"],
-                "amount_ils": -pending["amount_ils"],
-                "balance_ils": 1850.40 - pending["amount_ils"],
-                "status": "אושר",
-                "can_cancel": True,
-                "can_approve": False
-            })
             return {
                 "status": "approved",
                 "transaction_id": transaction_id,
@@ -482,7 +533,7 @@ class BudgetDriver:
         client = await self.get_client(username, password)
         resp = await client.request(
             "DELETE",
-            f"/Budget/CancelTransaction?transactionLineId={transaction_line_id}"
+            f"/Budget/MyTransactions?transactionLineId={transaction_line_id}"
         )
         if resp.status_code != 200:
             raise APIException(
@@ -496,6 +547,216 @@ class BudgetDriver:
             "transaction_line_id": transaction_line_id,
             "message": f"Transaction {transaction_line_id} cancelled."
         }
+
+    def get_report_types(self) -> List[Dict[str, Any]]:
+        """Returns catalogue of supported report types and their required parameters."""
+        return REPORT_DEFINITIONS
+
+    async def generate_report(
+        self,
+        username: str,
+        password: str,
+        report_id: int,
+        format: str = "json",
+        year: Optional[int] = None,
+        from_month: Optional[int] = None,
+        to_month: Optional[int] = None,
+        from_date: Optional[str] = None,
+        to_date: Optional[str] = None
+    ) -> Tuple[Any, str]:
+        """
+        Generates report from /Reports/Report.
+        Returns (result_data, content_type).
+        """
+        rep_def = next((r for r in REPORT_DEFINITIONS if r["id"] == report_id), None)
+        rep_name = rep_def["name"] if rep_def else f"Report {report_id}"
+        param_type = rep_def["parameter_type"] if rep_def else "monthly"
+
+        now = datetime.now()
+        cur_year = year or now.year
+        f_month = from_month or 1
+        t_month = to_month or (now.month if cur_year == now.year else 12)
+        f_date = from_date or (now - timedelta(days=90)).strftime("%d/%m/%Y")
+        t_date = to_date or now.strftime("%d/%m/%Y")
+
+        if config.MOCK_MODE:
+            if format == "json":
+                mock_items = [
+                    {
+                        "date": f"01/{f_month:02d}/{cur_year}",
+                        "document_no": "213000101",
+                        "details": "הקצבה חודשית",
+                        "credit_ils": 9245.78,
+                        "debit_ils": 0.0,
+                        "quantity": 1.0,
+                        "month": f"{f_month}/{cur_year}"
+                    },
+                    {
+                        "date": f"15/{f_month:02d}/{cur_year}",
+                        "document_no": "213000102",
+                        "details": "קניות כולבו",
+                        "credit_ils": 0.0,
+                        "debit_ils": 420.50,
+                        "quantity": 1.0,
+                        "month": f"{f_month}/{cur_year}"
+                    }
+                ]
+                return {
+                    "report_id": report_id,
+                    "report_name": rep_name,
+                    "period": f"{f_month}/{cur_year} - {t_month}/{cur_year}" if param_type == "monthly" else f"{f_date} - {t_date}",
+                    "summary": {
+                        "opening_balance_ils": 1500.00,
+                        "total_credits_ils": 9245.78,
+                        "total_debits_ils": 420.50,
+                        "interest_ils": 0.0,
+                        "closing_balance_ils": 10325.28
+                    },
+                    "items": mock_items,
+                    "total_items": len(mock_items)
+                }, "application/json"
+            elif format == "csv":
+                csv_bytes = b"Date,Document,Details,Credit,Debit\n01/01/2026,101,Mock,9000,0\n"
+                return csv_bytes, "text/csv"
+            elif format == "pdf":
+                return b"%PDF-1.7 mock", "application/pdf"
+            else:
+                return b"mock xls", "application/vnd.ms-excel"
+
+        # Build form payload for live report
+        form_data: Dict[str, str] = {
+            "selectedReportList[0].UserType": "1",
+            "selectedReportList[0].SelectedReport": str(report_id)
+        }
+
+        if param_type == "monthly":
+            form_data.update({
+                "Params[0].ParameterName": "Year",
+                "Params[0].ParameterType": "int",
+                "Params[0].Value": str(cur_year),
+                "Params[1].ParameterName": "FromMonth",
+                "Params[1].ParameterType": "int",
+                "Params[1].Value": str(f_month),
+                "Params[2].ParameterName": "ToMonth",
+                "Params[2].ParameterType": "int",
+                "Params[2].Value": str(t_month)
+            })
+        elif param_type == "date_range":
+            form_data.update({
+                "Params[0].ParameterName": "FromDate",
+                "Params[0].ParameterType": "DateTime",
+                "Params[0].Value": f_date,
+                "Params[1].ParameterName": "ToDate",
+                "Params[1].ParameterType": "DateTime",
+                "Params[1].Value": t_date
+            })
+
+        # Set export format trigger button
+        if format == "pdf":
+            form_data["pdf"] = ""
+        elif format == "xls":
+            form_data["xls"] = ""
+        else:
+            form_data["csv"] = "CSV"
+
+        client = await self.get_client(username, password)
+        resp = await client.post("/Reports/Report", data=form_data, timeout=60.0)
+
+        if resp.status_code != 200:
+            raise APIException(
+                status_code=502,
+                code="report_generation_failed",
+                message=f"Failed to generate report {report_id} (HTTP {resp.status_code})"
+            )
+
+        if format == "pdf":
+            return resp.content, "application/pdf"
+        elif format == "xls":
+            return resp.content, "application/vnd.ms-excel"
+        elif format == "csv":
+            return resp.content, "text/csv; charset=utf-8"
+
+        # Format is JSON: parse CSV content
+        content_str = resp.content.decode("utf-8-sig", errors="replace")
+        reader = csv.reader(io.StringIO(content_str))
+
+        line_items = []
+        opening_bal = None
+        closing_bal = None
+        total_credits = 0.0
+        total_debits = 0.0
+
+        for row in reader:
+            if not row:
+                continue
+
+            # Look for summary fields if present
+            for c_idx, val in enumerate(row):
+                if val == "יתרת פתיחה" and c_idx > 0:
+                    try:
+                        opening_bal = float(row[c_idx - 1].replace(",", ""))
+                    except ValueError:
+                        pass
+                elif val == "יתרת סגירה" and c_idx > 0:
+                    try:
+                        closing_bal = float(row[c_idx - 1].replace(",", ""))
+                    except ValueError:
+                        pass
+
+            # Detect date-anchored transaction line
+            for c_idx, val in enumerate(row):
+                if re.match(r"^\d{1,2}/\d{1,2}/\d{2,4}$", val.strip()):
+                    date_val = val.strip()
+                    doc_no = row[c_idx + 1].strip() if c_idx + 1 < len(row) else None
+                    details = row[c_idx - 1].strip() if c_idx - 1 >= 0 else ""
+                    qty_str = row[c_idx - 2].strip().replace(",", "") if c_idx - 2 >= 0 else "0"
+                    debit_str = row[c_idx - 3].strip().replace(",", "") if c_idx - 3 >= 0 else "0"
+                    credit_str = row[c_idx - 4].strip().replace(",", "") if c_idx - 4 >= 0 else "0"
+
+                    try:
+                        credit = float(credit_str)
+                    except ValueError:
+                        credit = 0.0
+                    try:
+                        debit = float(debit_str)
+                    except ValueError:
+                        debit = 0.0
+                    try:
+                        qty = float(qty_str)
+                    except ValueError:
+                        qty = 0.0
+
+                    total_credits += credit
+                    total_debits += debit
+
+                    line_items.append({
+                        "date": date_val,
+                        "document_no": doc_no,
+                        "details": details,
+                        "credit_ils": credit,
+                        "debit_ils": debit,
+                        "quantity": qty,
+                        "month": f"{f_month}/{cur_year}"
+                    })
+                    break
+
+        summary = {
+            "opening_balance_ils": opening_bal,
+            "total_credits_ils": round(total_credits, 2),
+            "total_debits_ils": round(total_debits, 2),
+            "interest_ils": None,
+            "closing_balance_ils": closing_bal
+        }
+
+        period_desc = f"{f_month}/{cur_year} - {t_month}/{cur_year}" if param_type == "monthly" else f"{f_date} - {t_date}"
+        return {
+            "report_id": report_id,
+            "report_name": rep_name,
+            "period": period_desc,
+            "summary": summary,
+            "items": line_items,
+            "total_items": len(line_items)
+        }, "application/json"
 
     async def get_pending_approvals(self, username: str, password: str) -> List[Dict[str, Any]]:
         """Fetches pending incoming charges/requests requiring approval."""
@@ -586,7 +847,6 @@ class BudgetDriver:
 
         soup = BeautifulSoup(resp.text, "html.parser")
         users = []
-        # Selected list: .selected-users-list li
         list_items = soup.select(".selected-users-list li")
         for li in list_items:
             name_span = li.find(class_="user-name")

@@ -3,7 +3,7 @@ from contextlib import asynccontextmanager
 from typing import Optional, List
 
 from fastapi import FastAPI, Depends, Header, Request, status, Query
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from fastapi.exceptions import RequestValidationError
 
 import config
@@ -26,7 +26,10 @@ from schemas import (
     AuthorizedUserItem,
     SetAuthorizedUserRequest,
     SetAuthorizedUserResponse,
-    ErrorResponse
+    ErrorResponse,
+    ReportTypesResponse,
+    ReportTypeItem,
+    ReportDataResponse
 )
 from security import (
     verify_bearer_token,
@@ -296,3 +299,51 @@ async def set_authorized_user(
         is_authorized=payload.is_authorized
     )
     return SetAuthorizedUserResponse(**result)
+
+@app.get("/reports/types", response_model=ReportTypesResponse)
+async def get_report_types():
+    """
+    GET /reports/types
+    Returns catalogue of available budget reports with their parameter specifications.
+    """
+    types = budget_driver.get_report_types()
+    return ReportTypesResponse(reports=[ReportTypeItem(**t) for t in types])
+
+@app.get("/reports/generate")
+async def generate_report(
+    report_id: int = Query(1, description="Report numeric ID (see /reports/types)"),
+    format: str = Query("json", description="Output format: 'json', 'csv', 'pdf', or 'xls'"),
+    year: Optional[int] = Query(None, description="Year for monthly reports (e.g. 2026)"),
+    from_month: Optional[int] = Query(None, description="Starting month (1-12)"),
+    to_month: Optional[int] = Query(None, description="Ending month (1-12)"),
+    from_date: Optional[str] = Query(None, description="Start date (DD/MM/YYYY) for date-range reports"),
+    to_date: Optional[str] = Query(None, description="End date (DD/MM/YYYY) for date-range reports"),
+    creds: BudgetCredentials = Depends(get_budget_credentials)
+):
+    """
+    GET /reports/generate
+    Generates and exports reports from budget.mmm.org.il.
+    When format='json', returns structured summary and line items.
+    When format='csv', 'pdf', or 'xls', returns the binary download.
+    """
+    data, media_type = await budget_driver.generate_report(
+        username=creds.username,
+        password=creds.password,
+        report_id=report_id,
+        format=format.lower(),
+        year=year,
+        from_month=from_month,
+        to_month=to_month,
+        from_date=from_date,
+        to_date=to_date
+    )
+
+    if format.lower() == "json":
+        return JSONResponse(content=data)
+
+    filename = f"report_{report_id}_{format}.{format}"
+    return Response(
+        content=data,
+        media_type=media_type,
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'}
+    )

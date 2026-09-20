@@ -10,6 +10,7 @@ class HealthResponse(BaseModel):
 class BalanceResponse(BaseModel):
     budget_balance_ils: float = Field(..., description="Available budget balance in ILS")
     savings_balance_ils: Optional[float] = Field(None, description="Private savings balance in ILS, if available")
+    phone_for_otp: Optional[str] = Field(None, description="Registered phone number where transfer OTP is sent")
     user_name: Optional[str] = Field(None, description="User full display name")
     user_id: Optional[str] = Field(None, description="User internal member/employee ID")
 
@@ -108,3 +109,36 @@ class ErrorDetail(BaseModel):
 
 class ErrorResponse(BaseModel):
     error: ErrorDetail
+
+class ReportTypeItem(BaseModel):
+    id: int = Field(..., description="Report numeric ID")
+    name: str = Field(..., description="Hebrew name of the report")
+    description: str = Field(..., description="English description of the report content")
+    parameter_type: str = Field(..., description="'monthly' (Year/FromMonth/ToMonth), 'date_range' (FromDate/ToDate), or 'none'")
+
+class ReportTypesResponse(BaseModel):
+    reports: List[ReportTypeItem] = Field(default_factory=list)
+
+class ReportLineItem(BaseModel):
+    date: Optional[str] = Field(None, description="Transaction date")
+    document_no: Optional[str] = Field(None, description="Document/invoice reference number")
+    details: str = Field(..., description="Item/charge description")
+    debit_ils: float = Field(0.0, description="Debit amount (charge)")
+    credit_ils: float = Field(0.0, description="Credit amount (allowance/refund)")
+    quantity: float = Field(0.0, description="Quantity")
+    month: Optional[str] = Field(None, description="Month/Year period")
+
+class ReportSummary(BaseModel):
+    opening_balance_ils: Optional[float] = None
+    total_credits_ils: Optional[float] = None
+    total_debits_ils: Optional[float] = None
+    interest_ils: Optional[float] = None
+    closing_balance_ils: Optional[float] = None
+
+class ReportDataResponse(BaseModel):
+    report_id: int
+    report_name: str
+    period: str
+    summary: Optional[ReportSummary] = None
+    items: List[ReportLineItem] = Field(default_factory=list)
+    total_items: int

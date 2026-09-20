@@ -165,6 +165,30 @@ curl -X PUT http://127.0.0.1:8001/account/authorized-users \
   }'
 ```
 
+### 11. List Available Report Types
+```bash
+curl -X GET http://127.0.0.1:8001/reports/types \
+  -H "Authorization: Bearer $JWT"
+```
+Returns all 20+ available Kibbutz reports (Personal budget, Kolbo supermarket, Dining room meals, Electricity, Water consumption, etc.) and their required parameter types (`monthly`, `date_range`, or `none`).
+
+### 12. Generate and View Reports (JSON or PDF/CSV Export)
+```bash
+# View personal monthly budget report as structured JSON with line items and balance totals
+curl -X GET "http://127.0.0.1:8001/reports/generate?report_id=1&format=json&year=2026&from_month=8&to_month=8" \
+  -H "Authorization: Bearer $JWT"
+
+# Download official PDF statement
+curl -X GET "http://127.0.0.1:8001/reports/generate?report_id=1&format=pdf&year=2026&from_month=8&to_month=8" \
+  -H "Authorization: Bearer $JWT" \
+  -o budget_report_08_2026.pdf
+
+# Download Kolbo supermarket itemized charges as CSV
+curl -X GET "http://127.0.0.1:8001/reports/generate?report_id=5&format=csv&from_date=01/08/2026&to_date=31/08/2026" \
+  -H "Authorization: Bearer $JWT" \
+  -o kolbo_charges.csv
+```
+
 ---
 
 ## 🧪 Running Tests

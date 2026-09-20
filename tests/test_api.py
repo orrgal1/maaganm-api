@@ -199,3 +199,36 @@ async def test_authorized_users(auth_headers):
         put_data = put_resp.json()
         assert put_data["status"] == "ok"
         assert put_data["is_authorized"] is True
+
+@pytest.mark.asyncio
+async def test_reports_types(auth_headers):
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.get("/reports/types", headers=auth_headers)
+        assert resp.status_code == 200
+        data = resp.json()
+        assert "reports" in data
+        assert len(data["reports"]) >= 10
+        first = data["reports"][0]
+        assert first["id"] == 1
+        assert first["name"] == "תקציב אישי"
+
+@pytest.mark.asyncio
+async def test_reports_generate_json(auth_headers):
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.get("/reports/generate?report_id=1&format=json&year=2026&from_month=1&to_month=8", headers=auth_headers)
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["report_id"] == 1
+        assert "summary" in data
+        assert "items" in data
+        assert len(data["items"]) >= 1
+
+@pytest.mark.asyncio
+async def test_reports_generate_csv(auth_headers):
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.get("/reports/generate?report_id=1&format=csv&year=2026", headers=auth_headers)
+        assert resp.status_code == 200
+        assert "text/csv" in resp.headers["content-type"]
