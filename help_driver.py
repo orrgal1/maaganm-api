@@ -1,7 +1,9 @@
+import hashlib
+import json
 import re
 from dataclasses import dataclass
 from typing import Any, Mapping, Optional, Sequence
-from urllib.parse import quote_from_bytes, urljoin
+from urllib.parse import quote_from_bytes, urlencode, urljoin, urlsplit
 
 import httpx
 from bs4 import BeautifulSoup
@@ -12,9 +14,29 @@ from errors import APIException
 
 _BASE_URL = "https://help.mmm.org.il"
 _PORTAL_PATH = "/hhopencall.pl"
+_SCHEDULER_BASE_URL = "https://hh-add.mmm.org.il"
+_SCHEDULER_PATH_PREFIX = "/ScheduleAppointment/"
 _TIMEOUT = httpx.Timeout(20.0)
 _MAX_RESPONSE_BYTES = 2 * 1024 * 1024
 _MAX_ATTACHMENTS = 5
+_MAX_SCHEDULE_SLOTS = 1000
+_SCHEDULE_FORM_FIELDS = (
+    "ScheduleViewModel.CallId",
+    "ScheduleViewModel.StrmCode",
+    "ScheduleViewModel.CustomerName",
+    "ScheduleViewModel.TechnicianEmail",
+    "ScheduleViewModel.AvailabilityCalendarName",
+    "ScheduleViewModel.CustomerEmail",
+    "ScheduleViewModel.AppointmentSubject",
+    "ScheduleViewModel.AppointmentDescription",
+    "ScheduleViewModel.SelectedStartTime",
+    "ScheduleViewModel.SelectedEndTime",
+    "ScheduleViewModel.SelectedEventId",
+    "AdminMode",
+    "AdminToken",
+    "AdminRangeSteps",
+    "__RequestVerificationToken",
+)
 _MAX_ATTACHMENT_BYTES = 4 * 1024 * 1024
 _ACTIONS = ("complain", "hurryup", "close", "reopen")
 _TRUE_VALUES = {"1", "true", "yes", "on", "open", "opened"}
@@ -33,6 +55,32 @@ class _CallRecord:
     state_value: str
 
 
+@dataclass
+class _HTTPResponse:
+    content: bytes
+    content_type: str
+    final_url: str
+
+
+@dataclass(frozen=True)
+class _ScheduleSlot:
+    source_event_id: str
+    start: str
+    end: str
+
+
+@dataclass(frozen=True)
+class _CurrentScheduleSlot:
+    start: str
+    end: str
+
+
+@dataclass
+class _SchedulePage:
+    form_values: dict[str, str]
+    slots: list[_ScheduleSlot]
+    current: Optional[_CurrentScheduleSlot]
+
 class HelpPortalDriver:
     """Async driver for the service-center HTML form application."""
 
@@ -40,8 +88,11 @@ class HelpPortalDriver:
         self,
         base_url: str = _BASE_URL,
         client: Optional[httpx.AsyncClient] = None,
+        scheduler_base_url: str = _SCHEDULER_BASE_URL,
+        scheduler_client: Optional[httpx.AsyncClient] = None,
     ) -> None:
         self._base_url = base_url.rstrip("/") + "/"
+        self._scheduler_base_url = scheduler_base_url.rstrip("/") + "/"
         self._client = client or httpx.AsyncClient(
             timeout=_TIMEOUT,
             follow_redirects=True,
@@ -50,10 +101,13 @@ class HelpPortalDriver:
                 "Accept-Language": "he-IL,he;q=0.9,en;q=0.7",
             },
         )
+        self._scheduler_client = scheduler_client or self._client
 
     async def close(self) -> None:
         if not self._client.is_closed:
             await self._client.aclose()
+        if self._scheduler_client is not self._client and not self._scheduler_client.is_closed:
+            await self._scheduler_client.aclose()
 
     async def get_catalog(self, member_id: Any) -> dict[str, Any]:
         page = await self._fetch_page(member_id)
@@ -109,28 +163,86 @@ class HelpPortalDriver:
         else:
             files.append(("imagefile", ("", b"", "application/octet-stream")))
 
-        content, content_type = await self._request("POST", _PORTAL_PATH, files=files)
-        result = self._parse_page(content, content_type)
+        response = await self._request("POST", _PORTAL_PATH, files=files)
         previous_ids = {call.public["id"] for call in fresh.calls}
-        created = [
-            call for call in result.calls if call.public["id"] not in previous_ids
-        ]
-        normalized_description = _normalize_text(description)
-        normalized_details = _normalize_text(details)
-        if (
-            len(created) != 1
-            or _normalize_text(created[0].public["description"])
-            != normalized_description
-            or (
-                normalized_details
-                and normalized_details
-                not in _normalize_text(
-                    f"{created[0].public['description']} {created[0].public['note']}"
-                )
+        scheduler_call_id = self._scheduler_call_id_from_url(response.final_url)
+        if category == "616" and scheduler_call_id is not None:
+            result = await self._fetch_page(member_id)
+            created = self._confirm_created_call(
+                result,
+                previous_ids,
+                description,
+                details,
+                expected_id=scheduler_call_id,
             )
-        ):
-            raise _error(502, "help_write_unconfirmed", "The service-center change could not be confirmed.")
-        return dict(created[0].public)
+            public = dict(created.public)
+            public["scheduling"] = {"mode": "calendar", "call_id": scheduler_call_id}
+            return public
+
+        result = self._parse_page(response.content, response.content_type)
+        created = self._confirm_created_call(result, previous_ids, description, details)
+        public = dict(created.public)
+        handler = _normalize_text(public.get("handler", ""))
+        public["scheduling"] = (
+            {"mode": "assigned", "handler": handler}
+            if handler
+            else {"mode": "unknown"}
+        )
+        return public
+
+    async def get_schedule_options(self, call_id: str) -> dict[str, Any]:
+        target_id = _validated_schedule_call_id(call_id)
+        page = await self._fetch_schedule_page(target_id)
+        result: dict[str, Any] = {
+            "call_id": target_id,
+            "slots": [_public_schedule_slot(slot) for slot in page.slots],
+        }
+        if page.current is not None:
+            result["current"] = _public_current_schedule_slot(page.current)
+        return result
+
+    async def book_schedule(self, call_id: str, slot_id: str) -> dict[str, Any]:
+        target_id = _validated_schedule_call_id(call_id)
+        target_slot_id = _validated_public_slot_id(slot_id)
+        fresh = await self._fetch_schedule_page(target_id)
+        selected = next(
+            (slot for slot in fresh.slots if _schedule_slot_id(slot) == target_slot_id),
+            None,
+        )
+        if selected is None:
+            raise _error(
+                400,
+                "help_schedule_slot_unavailable",
+                "The requested appointment slot is unavailable.",
+            )
+
+        payload = dict(fresh.form_values)
+        payload["ScheduleViewModel.SelectedStartTime"] = selected.start
+        payload["ScheduleViewModel.SelectedEndTime"] = selected.end
+        payload["ScheduleViewModel.SelectedEventId"] = selected.source_event_id
+        await self._request(
+            "POST",
+            self._schedule_path(target_id),
+            scheduler=True,
+            content=urlencode(payload).encode("utf-8"),
+            headers={"Content-Type": "application/x-www-form-urlencoded; charset=utf-8"},
+        )
+
+        confirmed = await self._fetch_schedule_page(target_id)
+        current = confirmed.current
+        if current is None or current.start != selected.start or current.end != selected.end:
+            raise _error(
+                502,
+                "help_write_unconfirmed",
+                "The service-center change could not be confirmed.",
+            )
+        return {
+            "call_id": target_id,
+            "appointment": {
+                "id": target_slot_id,
+                **_public_current_schedule_slot(current),
+            },
+        }
 
     async def act_on_call(
         self,
@@ -163,35 +275,56 @@ class HelpPortalDriver:
             "member": member_id,
         }
         encoded_payload = _encode_form_payload(payload)
-        content, content_type = await self._request(
+        response = await self._request(
             "POST",
             _PORTAL_PATH,
             content=encoded_payload,
             headers={"Content-Type": "application/x-www-form-urlencoded"},
         )
-        result = self._parse_page(content, content_type)
+        result = self._parse_page(response.content, response.content_type)
         after = next((call for call in result.calls if call.public["id"] == target_id), None)
         if after is None or not self._action_confirmed(before, after, action, str(text)):
             raise _error(502, "help_write_unconfirmed", "The service-center change could not be confirmed.")
         return dict(after.public)
 
     async def _fetch_page(self, member_id: Any) -> _Page:
-        content, content_type = await self._request(
+        response = await self._request(
             "POST",
             _PORTAL_PATH,
             content=_encode_form_payload({"member": member_id}),
             headers={"Content-Type": "application/x-www-form-urlencoded"},
         )
-        return self._parse_page(content, content_type)
+        return self._parse_page(response.content, response.content_type)
 
-    async def _request(self, method: str, path: str, **kwargs: Any) -> tuple[bytes, str]:
-        url = urljoin(self._base_url, path.lstrip("/"))
+    async def _fetch_schedule_page(self, call_id: str) -> _SchedulePage:
+        response = await self._request(
+            "GET",
+            self._schedule_path(call_id),
+            scheduler=True,
+        )
+        return self._parse_schedule_page(response.content, response.content_type, call_id)
+
+    async def _request(
+        self,
+        method: str,
+        path: str,
+        *,
+        scheduler: bool = False,
+        **kwargs: Any,
+    ) -> _HTTPResponse:
+        base_url = self._scheduler_base_url if scheduler else self._base_url
+        client = self._scheduler_client if scheduler else self._client
+        url = urljoin(base_url, path.lstrip("/"))
         try:
-            async with self._client.stream(
+            async with client.stream(
                 method, url, timeout=_TIMEOUT, follow_redirects=True, **kwargs
             ) as response:
                 if response.status_code < 200 or response.status_code >= 300:
                     raise _error(502, "help_portal_unavailable", "The service center is unavailable.")
+                if scheduler and _url_origin(urlsplit(str(response.url))) != _url_origin(
+                    urlsplit(self._scheduler_base_url)
+                ):
+                    raise _invalid_response()
                 body = bytearray()
                 async for chunk in response.aiter_bytes():
                     body.extend(chunk)
@@ -201,11 +334,140 @@ class HelpPortalDriver:
                             "help_portal_invalid_response",
                             "Service center returned an invalid response.",
                         )
-                return bytes(body), response.headers.get("content-type", "")
+                final_url = str(response.url.copy_with(query=None, fragment=None))
+                return _HTTPResponse(
+                    content=bytes(body),
+                    content_type=response.headers.get("content-type", ""),
+                    final_url=final_url,
+                )
         except APIException:
             raise
         except httpx.HTTPError as exc:
             raise _error(502, "help_portal_unavailable", "The service center is unavailable.") from exc
+
+    def _confirm_created_call(
+        self,
+        page: _Page,
+        previous_ids: set[str],
+        description: str,
+        details: str,
+        *,
+        expected_id: Optional[str] = None,
+    ) -> _CallRecord:
+        if expected_id is None:
+            candidates = [
+                call for call in page.calls if call.public["id"] not in previous_ids
+            ]
+        else:
+            candidates = [
+                call
+                for call in page.calls
+                if call.public["id"] == expected_id
+                and call.public["id"] not in previous_ids
+            ]
+        normalized_description = _normalize_text(description)
+        normalized_details = _normalize_text(details)
+        if (
+            len(candidates) != 1
+            or _normalize_text(candidates[0].public["description"])
+            != normalized_description
+            or (
+                normalized_details
+                and normalized_details
+                not in _normalize_text(
+                    f"{candidates[0].public['description']} {candidates[0].public['note']}"
+                )
+            )
+        ):
+            raise _error(
+                502,
+                "help_write_unconfirmed",
+                "The service-center change could not be confirmed.",
+            )
+        return candidates[0]
+
+    def _schedule_path(self, call_id: str) -> str:
+        return f"{_SCHEDULER_PATH_PREFIX}{call_id}"
+
+    def _scheduler_call_id_from_url(self, value: str) -> Optional[str]:
+        parsed = urlsplit(value)
+        expected = urlsplit(self._scheduler_base_url)
+        if _url_origin(parsed) != _url_origin(expected):
+            return None
+        match = re.fullmatch(r"/ScheduleAppointment/([0-9]+)", parsed.path)
+        return match.group(1) if match else None
+
+    def _parse_schedule_page(
+        self,
+        content: bytes,
+        content_type: str,
+        call_id: str,
+    ) -> _SchedulePage:
+        soup = BeautifulSoup(_decode_html(content, content_type), "html.parser")
+        token = soup.find(attrs={"name": "__RequestVerificationToken"})
+        form = token.find_parent("form") if token is not None else None
+        if form is None:
+            raise _invalid_response()
+
+        form_values: dict[str, str] = {}
+        for name in _SCHEDULE_FORM_FIELDS:
+            control = form.find(attrs={"name": name})
+            if control is None or control.has_attr("disabled"):
+                raise _invalid_response()
+            form_values[name] = _control_value(control)
+        if (
+            form_values["ScheduleViewModel.CallId"] != call_id
+            or not form_values["__RequestVerificationToken"]
+        ):
+            raise _invalid_response()
+
+        raw_slots, raw_current = _extract_schedule_declarations(soup)
+        if len(raw_slots) > _MAX_SCHEDULE_SLOTS:
+            raise _invalid_response()
+        slots: list[_ScheduleSlot] = []
+        identities: set[tuple[str, str, str]] = set()
+        for item in raw_slots:
+            if not isinstance(item, dict):
+                raise _invalid_response()
+            source_event_id = item.get("sourceEventId")
+            start = item.get("start")
+            end = item.get("end")
+            required_keys = {"sourceEventId", "start", "end", "isAvailable", "isCurrent"}
+            if (
+                not required_keys.issubset(item)
+                or not isinstance(source_event_id, str)
+                or not source_event_id
+                or not isinstance(start, str)
+                or not start
+                or not isinstance(end, str)
+                or not end
+                or item.get("isAvailable") is not True
+                or item.get("isCurrent") is not False
+            ):
+                raise _invalid_response()
+            identity = (source_event_id, start, end)
+            if identity in identities:
+                raise _invalid_response()
+            identities.add(identity)
+            slots.append(_ScheduleSlot(source_event_id=source_event_id, start=start, end=end))
+
+        current = None
+        if raw_current is not None:
+            current_keys = {"id", "start", "end", "isCurrent", "isAvailable", "editable"}
+            if (
+                not current_keys.issubset(raw_current)
+                or raw_current.get("id") != "__current_slot__"
+                or not isinstance(raw_current.get("start"), str)
+                or not raw_current["start"]
+                or not isinstance(raw_current.get("end"), str)
+                or not raw_current["end"]
+                or raw_current.get("isCurrent") is not True
+                or raw_current.get("isAvailable") is not False
+                or raw_current.get("editable") is not False
+            ):
+                raise _invalid_response()
+            current = _CurrentScheduleSlot(start=raw_current["start"], end=raw_current["end"])
+        return _SchedulePage(form_values=form_values, slots=slots, current=current)
 
     def _parse_page(self, content: bytes, content_type: str) -> _Page:
         soup = BeautifulSoup(_decode_html(content, content_type), "html.parser")
@@ -236,6 +498,8 @@ class HelpPortalDriver:
                 "help_portal_invalid_response",
                 "Service center returned an invalid response.",
             )
+        for category in categories:
+            category["scheduling"] = _category_scheduling(category["id"])
 
         result: dict[str, Any] = {"categories": categories, "contacts": contacts}
         residence = _field_value(soup, "dira")
@@ -421,6 +685,98 @@ class HelpPortalDriver:
         return normalized_text not in before_text and normalized_text in after_text
 
 
+def _validated_schedule_call_id(value: Any) -> str:
+    call_id = str(value).strip()
+    if not re.fullmatch(r"[0-9]{1,32}", call_id):
+        raise _error(
+            400,
+            "help_call_unavailable",
+            "The requested service call is unavailable.",
+        )
+    return call_id
+
+
+def _extract_schedule_declarations(soup: BeautifulSoup) -> tuple[list[Any], Any]:
+    decoder = json.JSONDecoder()
+    available: list[Any] = []
+    currents: list[Any] = []
+    patterns = (
+        (re.compile(r"\b(?:const|let|var)\s+availableSlots\s*=\s*"), available),
+        (re.compile(r"\b(?:const|let|var)\s+currentSlotEvent\s*=\s*"), currents),
+    )
+    for script in soup.find_all("script"):
+        source = script.string if script.string is not None else script.get_text()
+        for pattern, declarations in patterns:
+            for match in pattern.finditer(source):
+                try:
+                    value, _ = decoder.raw_decode(source, match.end())
+                except (json.JSONDecodeError, TypeError) as exc:
+                    raise _invalid_response() from exc
+                declarations.append(value)
+    if len(available) != 1 or len(currents) != 1 or not isinstance(available[0], list):
+        raise _invalid_response()
+    return available[0], currents[0]
+
+
+def _validated_public_slot_id(value: Any) -> str:
+    slot_id = str(value).strip()
+    if not re.fullmatch(r"[0-9a-f]{64}", slot_id):
+        raise _error(
+            400,
+            "help_schedule_slot_unavailable",
+            "The requested appointment slot is unavailable.",
+        )
+    return slot_id
+
+
+def _schedule_slot_id(slot: _ScheduleSlot) -> str:
+    identity = json.dumps(
+        [slot.source_event_id, slot.start, slot.end],
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(identity).hexdigest()
+
+
+def _public_schedule_slot(slot: _ScheduleSlot) -> dict[str, str]:
+    return {
+        "id": _schedule_slot_id(slot),
+        "start": slot.start,
+        "end": slot.end,
+    }
+
+def _public_current_schedule_slot(slot: _CurrentScheduleSlot) -> dict[str, str]:
+    return {"start": slot.start, "end": slot.end}
+
+
+def _category_scheduling(category_id: str) -> dict[str, str]:
+    if category_id == "616":
+        return {"mode": "calendar"}
+    if category_id == "624":
+        return {
+            "mode": "contact",
+            "phone": "077-7076023",
+            "extension": "2",
+        }
+    return {"mode": "unknown"}
+
+
+def _url_origin(value: Any) -> tuple[str, str, Optional[int]]:
+    return (
+        str(value.scheme).lower(),
+        str(value.hostname or "").lower(),
+        value.port,
+    )
+
+
+def _invalid_response() -> APIException:
+    return _error(
+        502,
+        "help_portal_invalid_response",
+        "Service center returned an invalid response.",
+    )
+
+
 def _normalize_text(value: Any) -> str:
     return " ".join(str(value).split())
 
@@ -588,4 +944,11 @@ def _error(status_code: int, code: str, message: str) -> APIException:
     return APIException(status_code=status_code, code=code, message=message)
 
 
-help_portal_driver = HelpPortalDriver(getattr(config, "HELP_BASE_URL", _BASE_URL))
+help_portal_driver = HelpPortalDriver(
+    getattr(config, "HELP_BASE_URL", _BASE_URL),
+    scheduler_base_url=getattr(
+        config,
+        "HELP_SCHEDULER_BASE_URL",
+        _SCHEDULER_BASE_URL,
+    ),
+)

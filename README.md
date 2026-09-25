@@ -43,6 +43,8 @@ The driver mapping and command arguments are:
 | `reports.generate` | read | `generate_report` | not required | `report` (slug or numeric ID), `format` (optional; default `json`), `year` (integer, optional), `from_month` (integer, optional), `to_month` (integer, optional), `from_date` (optional), `to_date` (optional) |
 | `help.catalog` | read | `get_catalog` | not required | `{}` |
 | `help.calls.list` | read | `list_calls` | not required | `{}` |
+| `help.call.schedule.options` | read | `get_schedule_options` | not required | exactly `{"call_id":"<nonempty string>"}` |
+| `help.call.schedule.book` | write | `book_schedule` | required | exactly `{"call_id":"<nonempty string>","slot_id":"<nonempty string>"}` |
 | `transfer.stage` | write | `transfer` | required | `recipient_hid`, `recipient_name`, `amount_ils`, `details_receiver` (optional), `details_sender` (optional), `transaction_type` (integer, optional; default 1) |
 | `transfer.approve` | write | `approve_otp` | required | `transaction_id`, `otp_code` |
 | `transaction.delete` | write | `cancel_transaction` | required | `transaction_line_id` |
@@ -56,6 +58,30 @@ The driver mapping and command arguments are:
 
 The `reports.catalog` response includes transport-neutral `example_args` objects for each report. Pass one of those objects as the `args` value of a `reports.generate` command; they do not contain Gmail- or CLI-specific fields.
 For `help.call.create`, each attachment must be an object with a safe, nonempty `filename`, a safe, nonempty MIME `content_type`, and strictly valid base64 `content_base64`. The attachment list has at most 5 items, and the aggregate decoded attachment content is limited to 4 MiB.
+
+### Help-call scheduling
+
+Creation and calendar scheduling use a strict create → options → book flow:
+
+1. Send `help.call.create` and wait for its result. Creation never books a
+   calendar slot automatically.
+2. Send the read command `help.call.schedule.options` with exactly
+   `{"call_id":"<nonempty string>"}`. The response contains opaque slot IDs;
+   clients choose one of those IDs without interpreting its contents.
+3. Send `help.call.schedule.book` with exactly
+   `{"call_id":"<nonempty string>","slot_id":"<nonempty string>"}`. Booking is
+   a separate write and must pass its own approval and expiry gate; approval
+   for creation does not approve booking. Request-ID idempotency still applies
+   to the booking command.
+Scheduling metadata is documented only where observed: category `616` yields
+`"scheduling":{"mode":"calendar"}`; category `624` yields
+`"scheduling":{"mode":"contact","phone":"077-7076023","extension":"2"}`. Every
+other category yields `"scheduling":{"mode":"unknown"}`; no other
+classification is supported. When creation follows a scheduler redirect, its
+result includes `"scheduling":{"mode":"calendar","call_id":"..."}`. A normal
+creation includes `"scheduling":{"mode":"assigned","handler":"..."}` only for
+a nonempty handler and includes `"scheduling":{"mode":"unknown"}` otherwise.
+These modes do not imply that creation booked a slot.
 
 Unknown verbs and unknown/malformed arguments fail closed. Binary report results are encoded as base64 in `payload`, together with `media_type` and `filename`; JSON reports remain structured JSON.
 
@@ -71,7 +97,7 @@ Pending state is the absence of the configured processed label name (`Agents` by
 
 The worker also uses `MAAGANM_EMAIL_LABEL_NAME` (default `Agents`) to identify pending messages and `MAAGANM_EMAIL_LABEL_ID` (default `Label_35`) to mark a successfully replied-to message as processed. `GAPI_MAX_OUTPUT_BYTES` bounds each captured `gapi` stdout and stderr stream (default `8388608` bytes). The email alias defaults to `orrgal+agents+maaganm@gmail.com` and the sender defaults to `orgal@mail.instinct.com`.
 
-The worker also needs the local budget portal username and password, plus a locally provisioned help-portal member identifier for help operations. Keep those values only in the local environment and never in command bodies, results, logs, or documentation.
+The worker also needs the local budget portal username and password, plus a locally provisioned help-portal member identifier for help operations. Keep those values only in the local environment and never in command bodies, results, logs, or documentation. `HELP_SCHEDULER_BASE_URL` configures the scheduler endpoint and defaults to `https://hh-add.mmm.org.il`; like `HELP_BASE_URL`, a trailing slash is stripped.
 
 When `MOCK_MODE=true`, budget operations retain their documented mock behavior (empty budget credentials are replaced with local mock credentials), but all help operations are unavailable and fail closed through the unavailable-dependency path; no real help driver or member identifier is configured.
 
@@ -83,7 +109,7 @@ When `MOCK_MODE=true`, budget operations retain their documented mock behavior (
 - Run only one worker process for a given `MAAGANM_EMAIL_DB_PATH`; the CLI holds a lifetime lock so restart recovery cannot conflict with a live request.
 - A provisioned `MAAGANM_EMAIL_HMAC_SECRET` is available at startup.
 - Valid local `BUDGET_USERNAME` and `BUDGET_PASSWORD` are available; set `BUDGET_BASE_URL` for the budget portal as needed.
-- `HELP_MEMBER_ID` is provisioned locally (leave the template blank); `HELP_BASE_URL` defaults to `https://help.mmm.org.il`.
+- `HELP_MEMBER_ID` is provisioned locally (leave the template blank); `HELP_BASE_URL` defaults to `https://help.mmm.org.il`, and `HELP_SCHEDULER_BASE_URL` defaults to `https://hh-add.mmm.org.il`.
 - Use `MOCK_MODE=true` only for local, non-production operation.
 
 ## Running

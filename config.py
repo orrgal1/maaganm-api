@@ -11,8 +11,12 @@ BUDGET_BASE_URL = os.getenv("BUDGET_BASE_URL", "https://budget.mmm.org.il").rstr
 BUDGET_USERNAME = os.getenv("BUDGET_USERNAME", "")
 BUDGET_PASSWORD = os.getenv("BUDGET_PASSWORD", "")
 
-# Help service member and endpoint
+# Help service member and endpoints
 HELP_BASE_URL = os.getenv("HELP_BASE_URL", "https://help.mmm.org.il").rstrip("/")
+HELP_SCHEDULER_BASE_URL = os.getenv(
+    "HELP_SCHEDULER_BASE_URL",
+    "https://hh-add.mmm.org.il",
+).rstrip("/")
 HELP_MEMBER_ID = os.getenv("HELP_MEMBER_ID", "")
 
 # Gmail command-bus runtime

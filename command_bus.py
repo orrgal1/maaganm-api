@@ -217,6 +217,11 @@ class HelpCallIdArgs(StrictModel):
     call_id: NonEmptyStr
 
 
+class HelpCallScheduleBookArgs(StrictModel):
+    call_id: NonEmptyStr
+    slot_id: NonEmptyStr
+
+
 class _CommandBase(StrictModel):
     id: NonEmptyStr
     issued_at: datetime
@@ -328,6 +333,16 @@ class HelpCallReopenCommand(_CommandBase):
     args: HelpCallIdArgs
 
 
+class HelpCallScheduleOptionsCommand(_CommandBase):
+    verb: Literal["help.call.schedule.options"]
+    args: HelpCallIdArgs
+
+
+class HelpCallScheduleBookCommand(_CommandBase):
+    verb: Literal["help.call.schedule.book"]
+    args: HelpCallScheduleBookArgs
+
+
 Command = Annotated[
     Union[
         HealthCommand,
@@ -350,6 +365,8 @@ Command = Annotated[
         HelpCallExpediteCommand,
         HelpCallCloseCommand,
         HelpCallReopenCommand,
+        HelpCallScheduleOptionsCommand,
+        HelpCallScheduleBookCommand,
     ],
     Field(discriminator="verb"),
 ]
@@ -384,6 +401,8 @@ VERBS: Mapping[str, VerbSpec] = MappingProxyType(
         "help.call.expedite": VerbSpec("write", HelpCallTextArgs),
         "help.call.close": VerbSpec("write", HelpCallIdArgs),
         "help.call.reopen": VerbSpec("write", HelpCallIdArgs),
+        "help.call.schedule.options": VerbSpec("read", HelpCallIdArgs),
+        "help.call.schedule.book": VerbSpec("write", HelpCallScheduleBookArgs),
     }
 )
 READ_VERBS = frozenset(verb for verb, spec in VERBS.items() if spec.kind == "read")
@@ -599,6 +618,8 @@ class BudgetDriverProtocol(Protocol):
 class HelpPortalDriverProtocol(Protocol):
     async def get_catalog(self, member_id: str) -> dict[str, Any]: ...
     async def list_calls(self, member_id: str) -> list[dict[str, Any]]: ...
+    async def get_schedule_options(self, call_id: str) -> dict[str, Any]: ...
+    async def book_schedule(self, call_id: str, slot_id: str) -> dict[str, Any]: ...
     async def create_call(
         self,
         member_id: str,
@@ -800,6 +821,15 @@ async def _invoke_driver(
         if isinstance(command, HelpCatalogCommand):
             return await portal.get_catalog(member_id)
         return _list_payload(await portal.list_calls(member_id))
+    if isinstance(command, HelpCallScheduleOptionsCommand):
+        portal = _require_help_driver(help_driver)
+        return await portal.get_schedule_options(call_id=args.call_id)
+    if isinstance(command, HelpCallScheduleBookCommand):
+        portal = _require_help_driver(help_driver)
+        return await portal.book_schedule(
+            call_id=args.call_id,
+            slot_id=args.slot_id,
+        )
     if isinstance(command, HelpCallCreateCommand):
         portal, member_id = _require_help_dependencies(
             help_driver,
@@ -852,13 +882,22 @@ async def _invoke_driver(
     raise TypeError("Unsupported validated command")
 
 
+def _require_help_driver(
+    help_driver: HelpPortalDriverProtocol | None,
+) -> HelpPortalDriverProtocol:
+    if help_driver is None:
+        raise RuntimeError("help portal dependencies are not configured")
+    return help_driver
+
+
 def _require_help_dependencies(
     help_driver: HelpPortalDriverProtocol | None,
     help_member_id: str | None,
 ) -> tuple[HelpPortalDriverProtocol, str]:
-    if help_driver is None or not help_member_id:
+    portal = _require_help_driver(help_driver)
+    if not help_member_id:
         raise RuntimeError("help portal dependencies are not configured")
-    return help_driver, help_member_id
+    return portal, help_member_id
 
 
 def _list_payload(items: Any) -> dict[str, Any]:

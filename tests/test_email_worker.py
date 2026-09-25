@@ -461,6 +461,30 @@ class FakeHelpDriver:
         self.calls.append(("action", member_id, kwargs))
         return {"id": kwargs["call_id"], "is_open": kwargs["action"] == "reopen"}
 
+    async def get_schedule_options(self, call_id):
+        self.calls.append(("schedule_options", call_id))
+        return {
+            "call_id": call_id,
+            "slots": [
+                {
+                    "id": "slot-public",
+                    "start": "2026-01-02T10:00:00Z",
+                    "end": "2026-01-02T10:30:00Z",
+                }
+            ],
+        }
+
+    async def book_schedule(self, call_id, slot_id):
+        self.calls.append(("schedule_book", call_id, slot_id))
+        return {
+            "call_id": call_id,
+            "appointment": {
+                "id": slot_id,
+                "start": "2026-01-02T10:00:00Z",
+                "end": "2026-01-02T10:30:00Z",
+            },
+        }
+
 
 def help_create_args(attachments=None):
     return {
@@ -523,6 +547,125 @@ async def test_help_read_verbs_map_to_help_driver(
     assert result.status == "ok"
     assert result.payload == expected_payload
     assert driver.calls == [expected_call]
+
+
+@pytest.mark.asyncio
+async def test_help_schedule_options_read_maps_without_approval():
+    driver = FakeHelpDriver()
+    command = parse_help_command(
+        "schedule-options",
+        "help.call.schedule.options",
+        {"call_id": "call-public"},
+    )
+
+    result = await dispatch_command(
+        command,
+        FakeDriver(),
+        "user",
+        "password",
+        help_driver=driver,
+        help_member_id="test-member",
+    )
+
+    assert result.status == "ok"
+    assert result.payload == {
+        "call_id": "call-public",
+        "slots": [
+            {
+                "id": "slot-public",
+                "start": "2026-01-02T10:00:00Z",
+                "end": "2026-01-02T10:30:00Z",
+            }
+        ],
+    }
+    assert driver.calls == [("schedule_options", "call-public")]
+
+
+@pytest.mark.asyncio
+async def test_help_schedule_book_maps_with_valid_approval():
+    driver = FakeHelpDriver()
+    command = parse_help_command(
+        "schedule-book",
+        "help.call.schedule.book",
+        {"call_id": "call-public", "slot_id": "slot-public"},
+        approval={"ref": "approved", "expires_at": "2099-01-01T00:00:00Z"},
+    )
+
+    result = await dispatch_command(
+        command,
+        FakeDriver(),
+        "user",
+        "password",
+        help_driver=driver,
+        help_member_id="test-member",
+    )
+
+    assert result.status == "ok"
+    assert result.payload == {
+        "call_id": "call-public",
+        "appointment": {
+            "id": "slot-public",
+            "start": "2026-01-02T10:00:00Z",
+            "end": "2026-01-02T10:30:00Z",
+        },
+    }
+    assert driver.calls == [("schedule_book", "call-public", "slot-public")]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("approval", "expected_status"),
+    [
+        (None, "approval_required"),
+        ({"ref": "expired", "expires_at": "2025-12-31T23:59:59Z"}, "approval_expired"),
+    ],
+)
+async def test_help_schedule_book_rejects_missing_or_expired_approval(
+    approval, expected_status
+):
+    driver = FakeHelpDriver()
+    command = parse_help_command(
+        f"schedule-book-{expected_status}",
+        "help.call.schedule.book",
+        {"call_id": "call-public", "slot_id": "slot-public"},
+        approval=approval,
+    )
+
+    result = await dispatch_command(
+        command,
+        FakeDriver(),
+        "user",
+        "password",
+        help_driver=driver,
+        help_member_id="test-member",
+    )
+
+    assert result.status == expected_status
+    assert driver.calls == []
+
+
+@pytest.mark.parametrize(
+    ("verb", "args"),
+    [
+        ("help.call.schedule.options", {}),
+        ("help.call.schedule.options", {"call_id": 42}),
+        ("help.call.schedule.options", {"call_id": ""}),
+        ("help.call.schedule.options", {"call_id": "call-public", "extra": "value"}),
+        ("help.call.schedule.book", {}),
+        ("help.call.schedule.book", {"call_id": 42, "slot_id": "slot-public"}),
+        ("help.call.schedule.book", {"call_id": "", "slot_id": "slot-public"}),
+        ("help.call.schedule.book", {"call_id": "call-public"}),
+        ("help.call.schedule.book", {"call_id": "call-public", "slot_id": 42}),
+        ("help.call.schedule.book", {"call_id": "call-public", "slot_id": ""}),
+        (
+            "help.call.schedule.book",
+            {"call_id": "call-public", "slot_id": "slot-public", "extra": "value"},
+        ),
+    ],
+)
+def test_help_schedule_verbs_reject_strict_invalid_args(verb, args):
+    with pytest.raises(ProtocolError, match=r"^Command arguments are invalid\.$"):
+        parse_help_command(f"invalid-{verb}", verb, args)
 
 
 @pytest.mark.asyncio
@@ -812,6 +955,49 @@ async def test_help_read_is_idempotent_through_email_worker(tmp_path):
     )
     assert await second.process_once() == 1
     assert driver.calls == [("catalog", "test-member")]
+    assert second_adapter.sent[0][1] == first_adapter.sent[0][1]
+
+
+@pytest.mark.asyncio
+async def test_help_schedule_book_is_idempotent_through_email_worker(tmp_path):
+    path = tmp_path / "requests.sqlite"
+    payload = envelope(
+        "same-schedule-book-id",
+        "help.call.schedule.book",
+        {"call_id": "call-public", "slot_id": "slot-public"},
+        approval={"ref": "approved", "expires_at": "2099-01-01T00:00:00Z"},
+    )
+    driver = FakeHelpDriver()
+    first_adapter = FakeAdapter([message(payload, message_id="first-book")])
+    first = EmailWorker(
+        first_adapter,
+        RequestStore(path),
+        FakeDriver(),
+        SECRET,
+        "user",
+        "password",
+        SENDER,
+        ALIAS,
+        help_driver=driver,
+        help_member_id="test-member",
+    )
+    assert await first.process_once() == 1
+
+    second_adapter = FakeAdapter([message(payload, message_id="second-book")])
+    second = EmailWorker(
+        second_adapter,
+        RequestStore(path),
+        FakeDriver(),
+        SECRET,
+        "user",
+        "password",
+        SENDER,
+        ALIAS,
+        help_driver=driver,
+        help_member_id="test-member",
+    )
+    assert await second.process_once() == 1
+    assert driver.calls == [("schedule_book", "call-public", "slot-public")]
     assert second_adapter.sent[0][1] == first_adapter.sent[0][1]
 
 
