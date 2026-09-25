@@ -541,31 +541,9 @@ def parse_help_command(request_id, verb, args, *, approval=None):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("verb", "expected_call", "expected_payload"),
-    [
-        (
-            "help.catalog",
-            ("catalog", "test-member"),
-            {
-                "categories": [{"id": "category", "name": "Category"}],
-                "contacts": [{"id": "contact", "name": "Contact"}],
-            },
-        ),
-        (
-            "help.calls.list",
-            ("list", "test-member"),
-            {"items": [{"id": "call", "is_open": True}], "total": 1},
-        ),
-    ],
-)
-async def test_help_read_verbs_map_to_help_driver(
-    verb,
-    expected_call,
-    expected_payload,
-):
+async def test_help_catalog_preserves_portal_data_and_exposes_scheduling_args():
     driver = FakeHelpDriver()
-    command = parse_help_command(f"read-{verb}", verb, {})
+    command = parse_help_command("read-help-catalog", "help.catalog", {})
 
     result = await dispatch_command(
         command,
@@ -577,17 +555,90 @@ async def test_help_read_verbs_map_to_help_driver(
     )
 
     assert result.status == "ok"
-    assert result.payload == expected_payload
-    assert driver.calls == [expected_call]
+    assert result.payload["categories"] == [{"id": "category", "name": "Category"}]
+    assert result.payload["contacts"] == [{"id": "contact", "name": "Contact"}]
+    assert set(result.payload) == {"categories", "contacts", "command_schemas"}
+    schemas = result.payload["command_schemas"]
+    assert set(schemas) == {
+        "help.call.schedule.options",
+        "help.call.schedule.replacements",
+        "help.call.schedule.book",
+        "help.call.schedule.move",
+    }
+    call_id = {
+        "oneOf": [
+            {"type": "string", "pattern": "^[0-9]{1,32}$"},
+            {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": (10**32) - 1,
+            },
+        ]
+    }
+    assert schemas["help.call.schedule.replacements"] == {
+        "kind": "read",
+        "approval_required": False,
+        "args": {
+            "type": "object",
+            "properties": {"call_id": call_id},
+            "required": ["call_id"],
+            "additionalProperties": False,
+        },
+    }
+    assert schemas["help.call.schedule.move"] == {
+        "kind": "write",
+        "approval_required": True,
+        "args": {
+            "type": "object",
+            "properties": {
+                "call_id": call_id,
+                "slot_id": {
+                    "type": "string",
+                    "minLength": 1,
+                    "pattern": r"\S",
+                },
+            },
+            "required": ["call_id", "slot_id"],
+            "additionalProperties": False,
+        },
+    }
+    serialized_schemas = json.dumps(schemas, sort_keys=True).lower()
+    assert "hmac" not in serialized_schemas
+    assert "csrf" not in serialized_schemas
+    assert "event_id" not in serialized_schemas
+    assert driver.calls == [("catalog", "test-member")]
 
 
 @pytest.mark.asyncio
-async def test_help_schedule_replacements_read_maps_member_and_call_without_approval():
+async def test_help_calls_list_maps_to_help_driver():
+    driver = FakeHelpDriver()
+    command = parse_help_command("read-help-calls", "help.calls.list", {})
+
+    result = await dispatch_command(
+        command,
+        FakeDriver(),
+        "user",
+        "password",
+        help_driver=driver,
+        help_member_id="test-member",
+    )
+
+    assert result.status == "ok"
+    assert result.payload == {
+        "items": [{"id": "call", "is_open": True}],
+        "total": 1,
+    }
+    assert driver.calls == [("list", "test-member")]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("call_id", ["6457734", 6457734])
+async def test_help_schedule_replacements_normalizes_call_id_before_dispatch(call_id):
     driver = FakeHelpDriver()
     command = parse_help_command(
-        "schedule-replacements",
+        f"schedule-replacements-{type(call_id).__name__}",
         "help.call.schedule.replacements",
-        {"call_id": "call-public"},
+        {"call_id": call_id},
     )
     result = await dispatch_command(
         command,
@@ -598,9 +649,9 @@ async def test_help_schedule_replacements_read_maps_member_and_call_without_appr
         help_member_id="test-member",
     )
     assert result.status == "ok"
-    assert result.payload["call_id"] == "call-public"
+    assert result.payload["call_id"] == "6457734"
     assert result.payload["replacement_slots"][0]["id"] == "slot-public"
-    assert driver.calls == [("schedule_replacements", "test-member", "call-public")]
+    assert driver.calls == [("schedule_replacements", "test-member", "6457734")]
 
 
 @pytest.mark.asyncio
@@ -609,7 +660,7 @@ async def test_help_schedule_move_maps_with_valid_approval():
     command = parse_help_command(
         "schedule-move",
         "help.call.schedule.move",
-        {"call_id": "call-public", "slot_id": "slot-public"},
+        {"call_id": "6457734", "slot_id": "slot-public"},
         approval={"ref": "approved", "expires_at": "2099-01-01T00:00:00Z"},
     )
     result = await dispatch_command(
@@ -623,7 +674,7 @@ async def test_help_schedule_move_maps_with_valid_approval():
     assert result.status == "ok"
     assert result.payload["status"] == "rescheduled"
     assert driver.calls == [
-        ("schedule_move", "test-member", "call-public", "slot-public")
+        ("schedule_move", "test-member", "6457734", "slot-public")
     ]
 
 
@@ -633,7 +684,7 @@ async def test_help_schedule_options_read_maps_without_approval():
     command = parse_help_command(
         "schedule-options",
         "help.call.schedule.options",
-        {"call_id": "call-public"},
+        {"call_id": "6457734"},
     )
 
     result = await dispatch_command(
@@ -647,7 +698,7 @@ async def test_help_schedule_options_read_maps_without_approval():
 
     assert result.status == "ok"
     assert result.payload == {
-        "call_id": "call-public",
+        "call_id": "6457734",
         "slots": [
             {
                 "id": "slot-public",
@@ -656,7 +707,7 @@ async def test_help_schedule_options_read_maps_without_approval():
             }
         ],
     }
-    assert driver.calls == [("schedule_options", "call-public")]
+    assert driver.calls == [("schedule_options", "6457734")]
 
 
 @pytest.mark.asyncio
@@ -665,7 +716,7 @@ async def test_help_schedule_book_maps_with_valid_approval():
     command = parse_help_command(
         "schedule-book",
         "help.call.schedule.book",
-        {"call_id": "call-public", "slot_id": "slot-public"},
+        {"call_id": "6457734", "slot_id": "slot-public"},
         approval={"ref": "approved", "expires_at": "2099-01-01T00:00:00Z"},
     )
 
@@ -680,14 +731,14 @@ async def test_help_schedule_book_maps_with_valid_approval():
 
     assert result.status == "ok"
     assert result.payload == {
-        "call_id": "call-public",
+        "call_id": "6457734",
         "appointment": {
             "id": "slot-public",
             "start": "2026-01-02T10:00:00Z",
             "end": "2026-01-02T10:30:00Z",
         },
     }
-    assert driver.calls == [("schedule_book", "call-public", "slot-public")]
+    assert driver.calls == [("schedule_book", "6457734", "slot-public")]
 
 
 @pytest.mark.asyncio
@@ -705,7 +756,7 @@ async def test_help_schedule_book_rejects_missing_or_expired_approval(
     command = parse_help_command(
         f"schedule-book-{expected_status}",
         "help.call.schedule.book",
-        {"call_id": "call-public", "slot_id": "slot-public"},
+        {"call_id": "6457734", "slot_id": "slot-public"},
         approval=approval,
     )
     result = await dispatch_command(
@@ -735,7 +786,7 @@ async def test_help_schedule_move_rejects_missing_or_expired_approval(
     command = parse_help_command(
         f"schedule-move-{expected_status}",
         "help.call.schedule.move",
-        {"call_id": "call-public", "slot_id": "slot-public"},
+        {"call_id": "6457734", "slot_id": "slot-public"},
         approval=approval,
     )
     result = await dispatch_command(
@@ -754,34 +805,39 @@ async def test_help_schedule_move_rejects_missing_or_expired_approval(
     ("verb", "args"),
     [
         ("help.call.schedule.options", {}),
-        ("help.call.schedule.options", {"call_id": 42}),
+        ("help.call.schedule.options", {"call_id": True}),
         ("help.call.schedule.options", {"call_id": ""}),
-        ("help.call.schedule.options", {"call_id": "call-public", "extra": "value"}),
+        ("help.call.schedule.options", {"call_id": " 6457734"}),
+        ("help.call.schedule.options", {"call_id": "6457734", "extra": "value"}),
         ("help.call.schedule.book", {}),
-        ("help.call.schedule.book", {"call_id": 42, "slot_id": "slot-public"}),
+        ("help.call.schedule.book", {"call_id": -42, "slot_id": "slot-public"}),
         ("help.call.schedule.book", {"call_id": "", "slot_id": "slot-public"}),
-        ("help.call.schedule.book", {"call_id": "call-public"}),
-        ("help.call.schedule.book", {"call_id": "call-public", "slot_id": 42}),
-        ("help.call.schedule.book", {"call_id": "call-public", "slot_id": ""}),
+        ("help.call.schedule.book", {"call_id": "6457734"}),
+        ("help.call.schedule.book", {"call_id": "6457734", "slot_id": 42}),
+        ("help.call.schedule.book", {"call_id": "6457734", "slot_id": ""}),
         (
             "help.call.schedule.book",
-            {"call_id": "call-public", "slot_id": "slot-public", "extra": "value"},
+            {"call_id": "6457734", "slot_id": "slot-public", "extra": "value"},
         ),
         ("help.call.schedule.replacements", {}),
-        ("help.call.schedule.replacements", {"call_id": 42}),
+        ("help.call.schedule.replacements", {"call_id": False}),
         ("help.call.schedule.replacements", {"call_id": ""}),
+        ("help.call.schedule.replacements", {"call_id": "6457734.0"}),
+        ("help.call.schedule.replacements", {"call_id": 10**32}),
         (
             "help.call.schedule.replacements",
-            {"call_id": "call-public", "extra": "value"},
+            {"call_id": "6457734", "extra": "value"},
         ),
         ("help.call.schedule.move", {}),
-        ("help.call.schedule.move", {"call_id": "call-public"}),
-        ("help.call.schedule.move", {"call_id": "call-public", "slot_id": 42}),
+        ("help.call.schedule.move", {"call_id": "6457734"}),
+        ("help.call.schedule.move", {"call_id": "6457734", "slot_id": 42}),
+        ("help.call.schedule.move", {"call_id": True, "slot_id": "slot-public"}),
         ("help.call.schedule.move", {"call_id": "", "slot_id": "slot-public"}),
-        ("help.call.schedule.move", {"call_id": "call-public", "slot_id": ""}),
+        ("help.call.schedule.move", {"call_id": "6457734", "slot_id": ""}),
+        ("help.call.schedule.move", {"call_id": "6457734", "slot_id": " "}),
         (
             "help.call.schedule.move",
-            {"call_id": "call-public", "slot_id": "slot-public", "extra": "value"},
+            {"call_id": "6457734", "slot_id": "slot-public", "extra": "value"},
         ),
     ],
 )
@@ -1086,7 +1142,7 @@ async def test_help_schedule_book_is_idempotent_through_email_worker(tmp_path):
     payload = envelope(
         "same-schedule-book-id",
         "help.call.schedule.book",
-        {"call_id": "call-public", "slot_id": "slot-public"},
+        {"call_id": "6457734", "slot_id": "slot-public"},
         approval={"ref": "approved", "expires_at": "2099-01-01T00:00:00Z"},
     )
     driver = FakeHelpDriver()
@@ -1119,7 +1175,7 @@ async def test_help_schedule_book_is_idempotent_through_email_worker(tmp_path):
         help_member_id="test-member",
     )
     assert await second.process_once() == 1
-    assert driver.calls == [("schedule_book", "call-public", "slot-public")]
+    assert driver.calls == [("schedule_book", "6457734", "slot-public")]
     assert second_adapter.sent[0][1] == first_adapter.sent[0][1]
 
 

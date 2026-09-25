@@ -43,10 +43,10 @@ The driver mapping and command arguments are:
 | `reports.generate` | read | `generate_report` | not required | `report` (slug or numeric ID), `format` (optional; default `json`), `year` (integer, optional), `from_month` (integer, optional), `to_month` (integer, optional), `from_date` (optional), `to_date` (optional) |
 | `help.catalog` | read | `get_catalog` | not required | `{}` |
 | `help.calls.list` | read | `list_calls` | not required | `{}` |
-| `help.call.schedule.options` | read | `get_schedule_options` | not required | exactly `{"call_id":"<nonempty string>"}` |
-| `help.call.schedule.replacements` | read | `get_schedule_replacements` | not required | exactly `{"call_id":"<nonempty string>"}` |
-| `help.call.schedule.book` | write | `book_schedule` | required | exactly `{"call_id":"<nonempty string>","slot_id":"<nonempty string>"}` |
-| `help.call.schedule.move` | write | `move_schedule` | required | exactly `{"call_id":"<nonempty string>","slot_id":"<nonempty string>"}` |
+| `help.call.schedule.options` | read | `get_schedule_options` | not required | exactly `{"call_id":"6457734"}` or `{"call_id":6457734}` |
+| `help.call.schedule.replacements` | read | `get_schedule_replacements` | not required | exactly `{"call_id":"6457734"}` or `{"call_id":6457734}` |
+| `help.call.schedule.book` | write | `book_schedule` | required | exactly `{"call_id":"6457734","slot_id":"<nonempty string>"}` or the same object with integer `call_id` |
+| `help.call.schedule.move` | write | `move_schedule` | required | exactly `{"call_id":"6457734","slot_id":"<nonempty string>"}` or the same object with integer `call_id` |
 | `transfer.stage` | write | `transfer` | required | `recipient_hid`, `recipient_name`, `amount_ils`, `details_receiver` (optional), `details_sender` (optional), `transaction_type` (integer, optional; default 1) |
 | `transfer.approve` | write | `approve_otp` | required | `transaction_id`, `otp_code` |
 | `transaction.delete` | write | `cancel_transaction` | required | `transaction_line_id` |
@@ -58,6 +58,8 @@ The driver mapping and command arguments are:
 | `help.call.close` | write | `act_on_call` (`close`) | required | `call_id` (nonempty string) |
 | `help.call.reopen` | write | `act_on_call` (`reopen`) | required | `call_id` (nonempty string) |
 
+For all `help.call.schedule.*` commands, `call_id` accepts a JSON string of 1–32 digits or a nonnegative JSON integer with up to 32 decimal digits, and is normalized to a decimal string. Strings containing whitespace, signs, or non-digits, and booleans, are invalid. `slot_id` remains a nonempty string. `help.catalog` retains its categories and contacts and adds a machine-readable `command_schemas` mapping whose scheduling entries expose the exact JSON Schema for command arguments.
+
 The `reports.catalog` response includes transport-neutral `example_args` objects for each report. Pass one of those objects as the `args` value of a `reports.generate` command; they do not contain Gmail- or CLI-specific fields.
 For `help.call.create`, each attachment must be an object with a safe, nonempty `filename`, a safe, nonempty MIME `content_type`, and strictly valid base64 `content_base64`. The attachment list has at most 5 items, and the aggregate decoded attachment content is limited to 4 MiB.
 
@@ -68,28 +70,31 @@ Creation and calendar scheduling use a strict create → options → book flow:
 1. Send `help.call.create` and wait for its result. Creation never books a
    calendar slot automatically.
 2. Send the read command `help.call.schedule.options` with exactly
-   `{"call_id":"<nonempty string>"}`. The response contains opaque slot IDs;
-   clients choose one of those IDs without interpreting its contents.
+   `{"call_id":"6457734"}` or `{"call_id":6457734}`. The response contains
+   opaque slot IDs; clients choose one without interpreting its contents.
 3. Send `help.call.schedule.book` with exactly
-   `{"call_id":"<nonempty string>","slot_id":"<nonempty string>"}`. Booking is
-   a separate write and must pass its own approval and expiry gate; approval
-   for creation does not approve booking. Request-ID idempotency still applies
+   `{"call_id":"6457734","slot_id":"<nonempty string>"}` (or the same object
+   with an integer `call_id`). Booking is a separate write and must pass its
+   own approval and expiry gate; approval for creation does not approve
+   booking. Request-ID idempotency still applies
    to the booking command. An already-booked call is refused by this operation.
 
 To reschedule an existing calendar appointment, use a replacement-slots then
 approved-move flow:
 
 1. Send `help.call.schedule.replacements` with exactly
-   `{"call_id":"<nonempty string>"}`. This read needs no approval. For a
-   calendar call it returns the `call_id`, `scheduling:{"mode":"calendar"}`,
-   the current `appointment` (`start`, `end`, `status:"scheduled"`), and
-   `replacement_slots` with opaque IDs. The response exposes no event IDs or
-   CSRF values; use each opaque `slot_id` exactly as returned.
+   `{"call_id":"6457734"}` or `{"call_id":6457734}`. This read needs no
+   approval. For a calendar call it returns the `call_id`,
+   `scheduling:{"mode":"calendar"}`, the current `appointment` (`start`,
+   `end`, `status:"scheduled"`), and `replacement_slots` with opaque IDs. The
+   response exposes no event IDs or CSRF values; use each opaque `slot_id`
+   exactly as returned.
 2. Send `help.call.schedule.move` with exactly
-   `{"call_id":"<nonempty string>","slot_id":"<nonempty string>"}` and an
-   unexpired approval. The worker re-fetches current state, requires an
-   existing current appointment and portal evidence that the appointment is
-   for the same call, posts the same-call update, and re-fetches to confirm.
+   `{"call_id":"6457734","slot_id":"<nonempty string>"}` (or the same object
+   with an integer `call_id`) and an unexpired approval. The worker re-fetches
+   current state, requires an existing current appointment and portal evidence
+   that the appointment is for the same call, posts the same-call update, and
+   re-fetches to confirm.
    Success returns the `call_id`, the selected public `appointment`
    (`id`, `start`, `end`, `status:"scheduled"`), and top-level
    `status:"rescheduled"`. Request-ID idempotency and approval expiry apply.

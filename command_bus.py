@@ -32,6 +32,11 @@ _SAFE_CONTENT_TYPE_RE = re.compile(
 )
 _MAX_HELP_ATTACHMENTS = 5
 _MAX_HELP_ATTACHMENT_BYTES = 4 * 1024 * 1024
+_MAX_SCHEDULE_CALL_ID_DIGITS = 32
+_MAX_SCHEDULE_CALL_ID = (10**_MAX_SCHEDULE_CALL_ID_DIGITS) - 1
+_SCHEDULE_CALL_ID_RE = re.compile(
+    rf"^[0-9]{{1,{_MAX_SCHEDULE_CALL_ID_DIGITS}}}$"
+)
 
 
 class IgnoreMessage(Exception):
@@ -62,6 +67,14 @@ def _non_empty(value: str) -> str:
 
 
 NonEmptyStr = Annotated[str, Field(min_length=1), AfterValidator(_non_empty)]
+
+def _normalize_schedule_call_id(value: Any) -> str:
+    if isinstance(value, bool) or not isinstance(value, (str, int)):
+        raise ValueError("must be a decimal string or integer")
+    candidate = str(value)
+    if not _SCHEDULE_CALL_ID_RE.fullmatch(candidate):
+        raise ValueError("must contain 1 to 32 decimal digits")
+    return str(int(candidate))
 
 
 def _utc_datetime(value: Any) -> datetime:
@@ -217,8 +230,16 @@ class HelpCallIdArgs(StrictModel):
     call_id: NonEmptyStr
 
 
-class HelpCallScheduleBookArgs(StrictModel):
-    call_id: NonEmptyStr
+class HelpCallScheduleArgs(StrictModel):
+    call_id: str
+
+    @field_validator("call_id", mode="before")
+    @classmethod
+    def normalize_call_id(cls, value: Any) -> str:
+        return _normalize_schedule_call_id(value)
+
+
+class HelpCallScheduleBookArgs(HelpCallScheduleArgs):
     slot_id: NonEmptyStr
 
 
@@ -335,22 +356,22 @@ class HelpCallReopenCommand(_CommandBase):
 
 class HelpCallScheduleOptionsCommand(_CommandBase):
     verb: Literal["help.call.schedule.options"]
-    args: HelpCallIdArgs
+    args: HelpCallScheduleArgs
+
 
 class HelpCallScheduleReplacementsCommand(_CommandBase):
     verb: Literal["help.call.schedule.replacements"]
-    args: HelpCallIdArgs
-
+    args: HelpCallScheduleArgs
 
 
 class HelpCallScheduleBookCommand(_CommandBase):
     verb: Literal["help.call.schedule.book"]
     args: HelpCallScheduleBookArgs
 
+
 class HelpCallScheduleMoveCommand(_CommandBase):
     verb: Literal["help.call.schedule.move"]
     args: HelpCallScheduleBookArgs
-
 
 
 Command = Annotated[
@@ -413,8 +434,8 @@ VERBS: Mapping[str, VerbSpec] = MappingProxyType(
         "help.call.expedite": VerbSpec("write", HelpCallTextArgs),
         "help.call.close": VerbSpec("write", HelpCallIdArgs),
         "help.call.reopen": VerbSpec("write", HelpCallIdArgs),
-        "help.call.schedule.options": VerbSpec("read", HelpCallIdArgs),
-        "help.call.schedule.replacements": VerbSpec("read", HelpCallIdArgs),
+        "help.call.schedule.options": VerbSpec("read", HelpCallScheduleArgs),
+        "help.call.schedule.replacements": VerbSpec("read", HelpCallScheduleArgs),
         "help.call.schedule.book": VerbSpec("write", HelpCallScheduleBookArgs),
         "help.call.schedule.move": VerbSpec("write", HelpCallScheduleBookArgs),
     }
@@ -730,6 +751,62 @@ async def dispatch_command(
         )
 
 
+def _help_command_schemas() -> dict[str, dict[str, Any]]:
+    def args_schema(*, slot: bool = False) -> dict[str, Any]:
+        properties: dict[str, Any] = {
+            "call_id": {
+                "oneOf": [
+                    {
+                        "type": "string",
+                        "pattern": rf"^[0-9]{{1,{_MAX_SCHEDULE_CALL_ID_DIGITS}}}$",
+                    },
+                    {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": _MAX_SCHEDULE_CALL_ID,
+                    },
+                ]
+            }
+        }
+        required = ["call_id"]
+        if slot:
+            properties["slot_id"] = {
+                "type": "string",
+                "minLength": 1,
+                "pattern": r"\S",
+            }
+            required.append("slot_id")
+        return {
+            "type": "object",
+            "properties": properties,
+            "required": required,
+            "additionalProperties": False,
+        }
+
+    return {
+        "help.call.schedule.options": {
+            "kind": "read",
+            "approval_required": False,
+            "args": args_schema(),
+        },
+        "help.call.schedule.replacements": {
+            "kind": "read",
+            "approval_required": False,
+            "args": args_schema(),
+        },
+        "help.call.schedule.book": {
+            "kind": "write",
+            "approval_required": True,
+            "args": args_schema(slot=True),
+        },
+        "help.call.schedule.move": {
+            "kind": "write",
+            "approval_required": True,
+            "args": args_schema(slot=True),
+        },
+    }
+
+
 async def _invoke_driver(
     command: Command,
     driver: BudgetDriverProtocol,
@@ -835,7 +912,8 @@ async def _invoke_driver(
             help_member_id,
         )
         if isinstance(command, HelpCatalogCommand):
-            return await portal.get_catalog(member_id)
+            catalog = await portal.get_catalog(member_id)
+            return {**catalog, "command_schemas": _help_command_schemas()}
         return _list_payload(await portal.list_calls(member_id))
     if isinstance(command, HelpCallScheduleOptionsCommand):
         portal = _require_help_driver(help_driver)
