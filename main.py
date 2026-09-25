@@ -1,357 +1,286 @@
-import logging
-from contextlib import asynccontextmanager
-from typing import Optional, List
+from __future__ import annotations
 
-from fastapi import FastAPI, Depends, Header, Request, status, Query
-from fastapi.responses import JSONResponse, Response
-from fastapi.exceptions import RequestValidationError
+import argparse
+import asyncio
+import errno
+import fcntl
+import json
+import logging
+from pathlib import Path
+from email.utils import getaddresses
+from typing import Any
 
 import config
-from schemas import (
-    HealthResponse,
-    BalanceResponse,
-    RecipientSearchResponse,
-    RecipientItem,
-    TransactionsResponse,
-    TransactionItem,
-    TransferRequest,
-    TransferResponse,
-    ApproveOtpRequest,
-    ApproveOtpResponse,
-    CancelTransactionResponse,
-    PendingApprovalsResponse,
-    PendingApprovalItem,
-    DeclineApprovalResponse,
-    AuthorizedUsersResponse,
-    AuthorizedUserItem,
-    SetAuthorizedUserRequest,
-    SetAuthorizedUserResponse,
-    ErrorResponse,
-    ReportTypesResponse,
-    ReportTypeItem,
-    ReportDataResponse
-)
-from security import (
-    verify_bearer_token,
-    get_budget_credentials,
-    BudgetCredentials,
-    APIException,
-    sanitize_log_message
-)
-from idempotency import idempotency_store
 from budget_driver import budget_driver
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+from command_bus import (
+    IgnoreMessage,
+    ProtocolError,
+    dispatch_command,
+    parse_command,
+    result_from_protocol_error,
+    result_json_bytes,
 )
-logger = logging.getLogger("maaganm_api")
+from help_driver import help_portal_driver
+from gmail_adapter import GmailAdapter, GmailAdapterError, GmailMessage
+from idempotency import RequestStore
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    logger.info("Initializing Maagan Michael Budget service...")
-    yield
-    logger.info("Shutting down Maagan Michael Budget service...")
-    await budget_driver.close()
+logger = logging.getLogger("maaganm_email_worker")
 
-app = FastAPI(
-    title="Maagan Michael Budget Local API Wrapper",
-    description="Local authenticated API wrapping Kibbutz Maagan Michael budget portal (budget.mmm.org.il)",
-    version="1.0.0",
-    lifespan=lifespan,
-    dependencies=[Depends(verify_bearer_token)]
-)
+_MOCK_USERNAME = "mock-user"
+_MOCK_PASSWORD = "mock-password"
 
-# ==================== Exception Handlers ====================
+_WORKER_ALREADY_RUNNING = "Another email worker is already running."
 
-@app.exception_handler(APIException)
-async def api_exception_handler(request: Request, exc: APIException):
-    return JSONResponse(
-        status_code=exc.status_code,
-        content={"error": {"code": exc.code, "message": exc.message}}
+
+class _WorkerLifetimeLock:
+    """Exclusive process lifetime lock for the supported worker CLI."""
+
+    def __init__(self, database_path: str | Path) -> None:
+        self.path = Path(f"{database_path}.lock")
+        self._file: Any | None = None
+
+    def acquire(self) -> None:
+        file = self.path.open("a+")
+        try:
+            fcntl.flock(file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as error:
+            file.close()
+            if error.errno in (errno.EACCES, errno.EAGAIN):
+                raise RuntimeError(_WORKER_ALREADY_RUNNING) from None
+            raise
+        self._file = file
+
+    def release(self) -> None:
+        if self._file is None:
+            return
+        try:
+            fcntl.flock(self._file.fileno(), fcntl.LOCK_UN)
+        finally:
+            self._file.close()
+            self._file = None
+
+
+class EmailWorker:
+    """Poll authenticated command messages and durably deliver their results."""
+
+    def __init__(
+        self,
+        adapter: GmailAdapter,
+        store: RequestStore,
+        driver: Any,
+        secret: str | bytes,
+        username: str,
+        password: str,
+        sender: str,
+        alias: str,
+        *,
+        help_driver: Any | None = None,
+        help_member_id: str | None = None,
+    ) -> None:
+        self.adapter = adapter
+        self.store = store
+        self.driver = driver
+        self.secret = secret
+        self.username = username
+        self.password = password
+        self.sender = sender
+        self.alias = alias
+        self.help_driver = help_driver
+        self.help_member_id = help_member_id
+        self.had_operational_failure = False
+
+    async def process_once(self) -> int:
+        """Process one metadata discovery pass and return fully acknowledged count."""
+        self.had_operational_failure = False
+        metadata_messages = await self.adapter.search_messages()
+        processed = 0
+
+        for metadata in metadata_messages:
+            if not self._has_expected_headers(metadata):
+                continue
+            try:
+                message = await self.adapter.fetch(metadata.id)
+            except GmailAdapterError:
+                self.had_operational_failure = True
+                logger.warning(
+                    "A Gmail message fetch failed; the message remains pending."
+                )
+                continue
+            if not self._has_expected_headers(message):
+                continue
+
+            command = None
+            protocol_error = None
+            try:
+                command = parse_command(message.subject, message.body, self.secret)
+                request_id = command.id
+            except IgnoreMessage:
+                continue
+            except ProtocolError as error:
+                if not _usable_request_id(error.request_id):
+                    continue
+                protocol_error = error
+                request_id = error.request_id
+
+            claim = self.store.claim(request_id)
+            if claim.in_progress:
+                continue
+
+            if claim.result is not None:
+                result_bytes = claim.result
+            elif claim.claimed:
+                if protocol_error is not None:
+                    result = result_from_protocol_error(protocol_error)
+                else:
+                    result = await dispatch_command(
+                        command,
+                        self.driver,
+                        self.username,
+                        self.password,
+                        help_driver=self.help_driver,
+                        help_member_id=self.help_member_id,
+                    )
+                result_bytes = self.store.complete(
+                    request_id,
+                    result_json_bytes(result),
+                )
+            else:
+                raise RuntimeError("invalid request claim state")
+
+            result_payload = json.loads(result_bytes)
+            try:
+                await self.adapter.send_result(request_id, result_payload)
+                await self.adapter.mark_processed(message.id)
+            except GmailAdapterError:
+                self.had_operational_failure = True
+                # The result is already durable, so this message can be replayed
+                # without risking another budget operation.
+                logger.warning("A Gmail operation failed; the message remains pending.")
+                continue
+
+            processed += 1
+
+        return processed
+
+    def _has_expected_headers(self, message: GmailMessage) -> bool:
+        return _is_single_mailbox(message.sender, self.sender) and _is_single_mailbox(
+            message.recipient,
+            self.alias,
+        )
+
+
+def _is_single_mailbox(header_value: object, expected: str) -> bool:
+    if not isinstance(header_value, str):
+        return False
+    parsed = getaddresses([header_value])
+    return (
+        len(parsed) == 1
+        and bool(parsed[0][1])
+        and parsed[0][1].casefold() == expected.casefold()
     )
 
-@app.exception_handler(RequestValidationError)
-async def validation_exception_handler(request: Request, exc: RequestValidationError):
-    return JSONResponse(
-        status_code=status.HTTP_400_BAD_REQUEST,
-        content={"error": {"code": "invalid_input", "message": str(exc)}}
+
+def _usable_request_id(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and bool(value)
+        and not any(character.isspace() for character in value)
     )
 
-@app.exception_handler(Exception)
-async def generic_exception_handler(request: Request, exc: Exception):
-    logger.error(f"Unhandled server error on {request.url.path}: {exc}", exc_info=True)
-    return JSONResponse(
-        status_code=status.HTTP_502_BAD_GATEWAY,
-        content={"error": {"code": "upstream_error", "message": f"Service encountered an error: {str(exc)}"}}
+
+def _budget_credentials() -> tuple[str, str]:
+    username = config.BUDGET_USERNAME
+    password = config.BUDGET_PASSWORD
+    if config.MOCK_MODE:
+        return username or _MOCK_USERNAME, password or _MOCK_PASSWORD
+    if not username or not password:
+        raise RuntimeError("Budget credentials are required")
+    return username, password
+
+def _help_member_id() -> str | None:
+    if config.MOCK_MODE:
+        return None
+    member_id = config.HELP_MEMBER_ID.strip()
+    if member_id:
+        return member_id
+    raise RuntimeError("HELP_MEMBER_ID is required")
+
+
+def _build_worker() -> EmailWorker:
+    secret = config.require_email_hmac_secret()
+    username, password = _budget_credentials()
+    help_member_id = _help_member_id()
+    adapter = GmailAdapter(
+        sender=config.MAAGANM_EMAIL_SENDER,
+        alias=config.MAAGANM_EMAIL_ALIAS,
+        label_name=config.MAAGANM_EMAIL_LABEL_NAME,
+        label_id=config.MAAGANM_EMAIL_LABEL_ID,
+        gapi_bin=config.GAPI_BIN,
+        max_output_bytes=config.GAPI_MAX_OUTPUT_BYTES,
+    )
+    store = RequestStore(config.MAAGANM_EMAIL_DB_PATH)
+    store.recover_in_progress()
+    return EmailWorker(
+        adapter,
+        store,
+        budget_driver,
+        secret,
+        username,
+        password,
+        config.MAAGANM_EMAIL_SENDER,
+        config.MAAGANM_EMAIL_ALIAS,
+        help_driver=None if config.MOCK_MODE else help_portal_driver,
+        help_member_id=help_member_id,
     )
 
-# ==================== Endpoints ====================
 
-@app.get("/health", response_model=HealthResponse)
-async def get_health(
-    creds: BudgetCredentials = Depends(get_budget_credentials)
-):
-    """
-    GET /health
-    Returns service health, operating mode (live vs mock), and caller auth status.
-    """
-    is_authed, user_id = await budget_driver.check_login_status(creds.username, creds.password)
-    return HealthResponse(
-        status="ok",
-        mode="mock" if config.MOCK_MODE else "live",
-        authenticated=is_authed,
-        user=user_id if is_authed else None
+async def _run(once: bool) -> int:
+    lock = _WorkerLifetimeLock(config.MAAGANM_EMAIL_DB_PATH)
+    try:
+        lock.acquire()
+        worker = _build_worker()
+        if once:
+            await worker.process_once()
+            return 1 if worker.had_operational_failure else 0
+
+        while True:
+            try:
+                await worker.process_once()
+            except GmailAdapterError:
+                logger.warning("Gmail polling failed; polling will continue.")
+            await asyncio.sleep(config.MAAGANM_EMAIL_POLL_SECONDS)
+    finally:
+        try:
+            await budget_driver.close()
+        finally:
+            try:
+                if not config.MOCK_MODE:
+                    await help_portal_driver.close()
+            finally:
+                lock.release()
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="Run the MaaganM Gmail command worker")
+    parser.add_argument(
+        "--once",
+        action="store_true",
+        help="process one polling pass and exit",
     )
+    args = parser.parse_args(argv)
 
-@app.get("/balance", response_model=BalanceResponse)
-async def get_balance(
-    creds: BudgetCredentials = Depends(get_budget_credentials)
-):
-    """
-    GET /balance
-    Fetches the caller's available personal budget balance and private savings balance.
-    """
-    balance = await budget_driver.get_balance(creds.username, creds.password)
-    return BalanceResponse(**balance)
-
-@app.get("/recipients/search", response_model=RecipientSearchResponse)
-async def search_recipients(
-    q: str = Query("", description="Search query by name or member ID"),
-    transaction_type: int = Query(1, description="Transaction type: 1 = regular transfer"),
-    creds: BudgetCredentials = Depends(get_budget_credentials)
-):
-    """
-    GET /recipients/search?q=<name_or_id>
-    Searches kibbutz members directory for transfer recipient selection.
-    """
-    results = await budget_driver.search_recipients(
-        creds.username,
-        creds.password,
-        query=q,
-        transaction_type=transaction_type
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
-    return RecipientSearchResponse(results=[RecipientItem(**r) for r in results])
+    try:
+        return asyncio.run(_run(args.once))
+    except KeyboardInterrupt:
+        return 130
+    except Exception:
+        logger.error("The email worker stopped because of an operational failure.")
+        return 1
 
-@app.get("/transactions", response_model=TransactionsResponse)
-async def get_transactions(
-    from_date: Optional[str] = Query(None, description="Start date (DD/MM/YYYY)"),
-    to_date: Optional[str] = Query(None, description="End date (DD/MM/YYYY)"),
-    types: Optional[str] = Query(None, description="Comma-separated transaction types (e.g. 1,2,3,4)"),
-    creds: BudgetCredentials = Depends(get_budget_credentials)
-):
-    """
-    GET /transactions?from_date=01/01/2026&to_date=20/09/2026
-    Retrieves the caller's transaction history with status, amounts, and cancellation eligibility.
-    """
-    transactions = await budget_driver.get_transactions(
-        creds.username,
-        creds.password,
-        from_date=from_date,
-        to_date=to_date,
-        types=types
-    )
-    return TransactionsResponse(
-        transactions=[TransactionItem(**t) for t in transactions],
-        total=len(transactions)
-    )
 
-@app.post("/transfer", response_model=TransferResponse)
-async def transfer_money(
-    payload: TransferRequest,
-    idempotency_key: Optional[str] = Header(None, alias="Idempotency-Key"),
-    creds: BudgetCredentials = Depends(get_budget_credentials)
-):
-    """
-    POST /transfer
-    Submits a money transfer to another kibbutz member.
-    If the system requires SMS OTP confirmation, response will have requires_otp=True and a transaction_id.
-    """
-    if idempotency_key:
-        cached = idempotency_store.get(idempotency_key)
-        if cached:
-            return JSONResponse(status_code=cached["status_code"], content=cached["body"])
-
-    result = await budget_driver.transfer(
-        username=creds.username,
-        password=creds.password,
-        recipient_hid=payload.recipient_hid,
-        recipient_name=payload.recipient_name,
-        amount_ils=payload.amount_ils,
-        details_receiver=payload.details_for_receiver or "",
-        details_sender=payload.details_for_sender or "",
-        transaction_type=payload.transaction_type
-    )
-
-    if idempotency_key:
-        idempotency_store.set(idempotency_key, status.HTTP_200_OK, result)
-
-    return TransferResponse(**result)
-
-@app.post("/transfer/approve", response_model=ApproveOtpResponse)
-async def approve_transfer_otp(
-    payload: ApproveOtpRequest,
-    idempotency_key: Optional[str] = Header(None, alias="Idempotency-Key"),
-    creds: BudgetCredentials = Depends(get_budget_credentials)
-):
-    """
-    POST /transfer/approve
-    Confirms a staged transfer using the SMS OTP code received on the registered mobile phone.
-    """
-    if idempotency_key:
-        cached = idempotency_store.get(idempotency_key)
-        if cached:
-            return JSONResponse(status_code=cached["status_code"], content=cached["body"])
-
-    result = await budget_driver.approve_otp(
-        username=creds.username,
-        password=creds.password,
-        transaction_id=payload.transaction_id,
-        otp_code=payload.otp_code
-    )
-
-    if idempotency_key:
-        idempotency_store.set(idempotency_key, status.HTTP_200_OK, result)
-
-    return ApproveOtpResponse(**result)
-
-@app.delete("/transactions/{transaction_line_id}", response_model=CancelTransactionResponse)
-async def cancel_transaction(
-    transaction_line_id: str,
-    idempotency_key: Optional[str] = Header(None, alias="Idempotency-Key"),
-    creds: BudgetCredentials = Depends(get_budget_credentials)
-):
-    """
-    DELETE /transactions/{transaction_line_id}
-    Cancels an eligible pending or recent transaction line.
-    """
-    if idempotency_key:
-        cached = idempotency_store.get(idempotency_key)
-        if cached:
-            return JSONResponse(status_code=cached["status_code"], content=cached["body"])
-
-    result = await budget_driver.cancel_transaction(
-        username=creds.username,
-        password=creds.password,
-        transaction_line_id=transaction_line_id
-    )
-
-    if idempotency_key:
-        idempotency_store.set(idempotency_key, status.HTTP_200_OK, result)
-
-    return CancelTransactionResponse(**result)
-
-@app.get("/approvals/pending", response_model=PendingApprovalsResponse)
-async def get_pending_approvals(
-    creds: BudgetCredentials = Depends(get_budget_credentials)
-):
-    """
-    GET /approvals/pending
-    Lists incoming charge requests waiting for your approval.
-    """
-    items = await budget_driver.get_pending_approvals(creds.username, creds.password)
-    return PendingApprovalsResponse(
-        items=[PendingApprovalItem(**i) for i in items],
-        total=len(items)
-    )
-
-@app.delete("/approvals/{transaction_line_id}", response_model=DeclineApprovalResponse)
-async def decline_approval(
-    transaction_line_id: str,
-    creds: BudgetCredentials = Depends(get_budget_credentials)
-):
-    """
-    DELETE /approvals/{transaction_line_id}
-    Declines an incoming charge request.
-    """
-    result = await budget_driver.decline_pending_approval(
-        username=creds.username,
-        password=creds.password,
-        transaction_line_id=transaction_line_id
-    )
-    return DeclineApprovalResponse(**result)
-
-@app.get("/account/authorized-users", response_model=AuthorizedUsersResponse)
-async def get_authorized_users(
-    creds: BudgetCredentials = Depends(get_budget_credentials)
-):
-    """
-    GET /account/authorized-users
-    Returns list of members authorized to charge your budget account directly.
-    """
-    users = await budget_driver.get_authorized_users(creds.username, creds.password)
-    return AuthorizedUsersResponse(users=[AuthorizedUserItem(**u) for u in users])
-
-@app.put("/account/authorized-users", response_model=SetAuthorizedUserResponse)
-async def set_authorized_user(
-    payload: SetAuthorizedUserRequest,
-    creds: BudgetCredentials = Depends(get_budget_credentials)
-):
-    """
-    PUT /account/authorized-users
-    Grants or revokes direct-charge authorization for a specific kibbutz member.
-    """
-    result = await budget_driver.set_authorized_user(
-        username=creds.username,
-        password=creds.password,
-        user_id=payload.user_id,
-        user_name=payload.user_name,
-        is_authorized=payload.is_authorized
-    )
-    return SetAuthorizedUserResponse(**result)
-
-@app.get("/reports/catalog", response_model=ReportTypesResponse)
-@app.get("/reports/types", response_model=ReportTypesResponse)
-async def get_report_catalog():
-    """
-    GET /reports/catalog (or /reports/types)
-    Returns the complete catalog of available Kibbutz reports, including machine-readable slugs
-    (e.g. 'personal_budget', 'kolbo', 'water', 'electricity'), expected parameters, and sample URLs.
-    """
-    types = budget_driver.get_report_types()
-    return ReportTypesResponse(
-        reports=[ReportTypeItem(**t) for t in types],
-        total=len(types)
-    )
-
-@app.get("/reports/generate", response_model=ReportDataResponse)
-async def generate_report(
-    report: Optional[str] = Query("personal_budget", description="Report slug (e.g. 'personal_budget', 'kolbo', 'water') or numeric ID (e.g. 1, 5)"),
-    report_id: Optional[int] = Query(None, description="Legacy report numeric ID (deprecated, use 'report')"),
-    format: str = Query("json", description="Output format: 'json', 'csv', 'pdf', or 'xls'"),
-    year: Optional[int] = Query(None, description="Year for monthly reports (e.g. 2026)"),
-    from_month: Optional[int] = Query(None, description="Starting month (1-12)"),
-    to_month: Optional[int] = Query(None, description="Ending month (1-12)"),
-    from_date: Optional[str] = Query(None, description="Start date (DD/MM/YYYY) for date-range reports"),
-    to_date: Optional[str] = Query(None, description="End date (DD/MM/YYYY) for date-range reports"),
-    creds: BudgetCredentials = Depends(get_budget_credentials)
-):
-    """
-    GET /reports/generate
-    Generates and exports reports from budget.mmm.org.il.
-    Accepts machine-readable slug (e.g. report='personal_budget', report='kolbo', report='water') or numeric ID.
-    When format='json', returns structured summary and itemized line items.
-    When format='csv', 'pdf', or 'xls', returns binary file download.
-    """
-    target_report = report_id if report_id is not None else (report or "personal_budget")
-    data, media_type = await budget_driver.generate_report(
-        username=creds.username,
-        password=creds.password,
-        report=target_report,
-        format=format.lower(),
-        year=year,
-        from_month=from_month,
-        to_month=to_month,
-        from_date=from_date,
-        to_date=to_date
-    )
-
-    if format.lower() == "json":
-        return JSONResponse(content=data)
-
-    filename = f"report_{target_report}_{format}.{format}"
-    return Response(
-        content=data,
-        media_type=media_type,
-        headers={"Content-Disposition": f'attachment; filename="{filename}"'}
-    )
+if __name__ == "__main__":
+    raise SystemExit(main())

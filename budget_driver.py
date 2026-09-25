@@ -11,7 +11,7 @@ from bs4 import BeautifulSoup
 import httpx
 
 import config
-from security import APIException, sanitize_log_message
+from errors import APIException
 from idempotency import pending_transfer_store
 
 logger = logging.getLogger("budget_driver")
@@ -24,7 +24,7 @@ REPORT_DEFINITIONS = [
         "description": "Personal monthly budget statement with allowances, expenses, and closing balance",
         "parameter_type": "monthly",
         "required_parameters": ["year", "from_month", "to_month"],
-        "example_query": "/reports/generate?report=personal_budget&format=json&year=2026&from_month=1&to_month=8"
+        "example_args": {"report": "personal_budget", "format": "json", "year": 2026, "from_month": 1, "to_month": 8}
     },
     {
         "id": 2,
@@ -33,7 +33,7 @@ REPORT_DEFINITIONS = [
         "description": "SederNet vehicle travel charges and mileage",
         "parameter_type": "date_range",
         "required_parameters": ["from_date", "to_date"],
-        "example_query": "/reports/generate?report=travel_sedernet&format=json&from_date=01/01/2026&to_date=20/09/2026"
+        "example_args": {"report": "travel_sedernet", "format": "json", "from_date": "01/01/2026", "to_date": "20/09/2026"}
     },
     {
         "id": 3,
@@ -42,7 +42,7 @@ REPORT_DEFINITIONS = [
         "description": "Dining room meal charges itemized by family member / buyer",
         "parameter_type": "date_range",
         "required_parameters": ["from_date", "to_date"],
-        "example_query": "/reports/generate?report=dining_room_by_buyer&format=json&from_date=01/01/2026&to_date=20/09/2026"
+        "example_args": {"report": "dining_room_by_buyer", "format": "json", "from_date": "01/01/2026", "to_date": "20/09/2026"}
     },
     {
         "id": 4,
@@ -51,7 +51,7 @@ REPORT_DEFINITIONS = [
         "description": "Dining room meal charges itemized chronologically by date",
         "parameter_type": "date_range",
         "required_parameters": ["from_date", "to_date"],
-        "example_query": "/reports/generate?report=dining_room_by_date&format=json&from_date=01/01/2026&to_date=20/09/2026"
+        "example_args": {"report": "dining_room_by_date", "format": "json", "from_date": "01/01/2026", "to_date": "20/09/2026"}
     },
     {
         "id": 5,
@@ -60,7 +60,7 @@ REPORT_DEFINITIONS = [
         "description": "Kolbo supermarket grocery and household itemized purchases",
         "parameter_type": "date_range",
         "required_parameters": ["from_date", "to_date"],
-        "example_query": "/reports/generate?report=kolbo&format=json&from_date=01/08/2026&to_date=31/08/2026"
+        "example_args": {"report": "kolbo", "format": "json", "from_date": "01/08/2026", "to_date": "31/08/2026"}
     },
     {
         "id": 6,
@@ -69,7 +69,7 @@ REPORT_DEFINITIONS = [
         "description": "Makolit local convenience store grocery purchases",
         "parameter_type": "date_range",
         "required_parameters": ["from_date", "to_date"],
-        "example_query": "/reports/generate?report=makolit&format=json&from_date=01/08/2026&to_date=31/08/2026"
+        "example_args": {"report": "makolit", "format": "json", "from_date": "01/08/2026", "to_date": "31/08/2026"}
     },
     {
         "id": 7,
@@ -78,7 +78,7 @@ REPORT_DEFINITIONS = [
         "description": "Local kibbutz branch store charges",
         "parameter_type": "date_range",
         "required_parameters": ["from_date", "to_date"],
-        "example_query": "/reports/generate?report=stores&format=json&from_date=01/08/2026&to_date=31/08/2026"
+        "example_args": {"report": "stores", "format": "json", "from_date": "01/08/2026", "to_date": "31/08/2026"}
     },
     {
         "id": 8,
@@ -87,7 +87,7 @@ REPORT_DEFINITIONS = [
         "description": "Complementary medicine treatments and wellness services",
         "parameter_type": "date_range",
         "required_parameters": ["from_date", "to_date"],
-        "example_query": "/reports/generate?report=complementary_medicine&format=json&from_date=01/01/2026&to_date=20/09/2026"
+        "example_args": {"report": "complementary_medicine", "format": "json", "from_date": "01/01/2026", "to_date": "20/09/2026"}
     },
     {
         "id": 9,
@@ -96,7 +96,7 @@ REPORT_DEFINITIONS = [
         "description": "Inter-budget transfers history between members",
         "parameter_type": "date_range",
         "required_parameters": ["from_date", "to_date"],
-        "example_query": "/reports/generate?report=budget_transfers&format=json&from_date=01/01/2026&to_date=20/09/2026"
+        "example_args": {"report": "budget_transfers", "format": "json", "from_date": "01/01/2026", "to_date": "20/09/2026"}
     },
     {
         "id": 10,
@@ -105,7 +105,7 @@ REPORT_DEFINITIONS = [
         "description": "Outside employment costing analysis",
         "parameter_type": "date_range",
         "required_parameters": ["from_date", "to_date"],
-        "example_query": "/reports/generate?report=outside_workers_costing&format=json&from_date=01/01/2026&to_date=20/09/2026"
+        "example_args": {"report": "outside_workers_costing", "format": "json", "from_date": "01/01/2026", "to_date": "20/09/2026"}
     },
     {
         "id": 11,
@@ -114,7 +114,7 @@ REPORT_DEFINITIONS = [
         "description": "Outside employment statements and income records",
         "parameter_type": "date_range",
         "required_parameters": ["from_date", "to_date"],
-        "example_query": "/reports/generate?report=outside_workers&format=json&from_date=01/01/2026&to_date=20/09/2026"
+        "example_args": {"report": "outside_workers", "format": "json", "from_date": "01/01/2026", "to_date": "20/09/2026"}
     },
     {
         "id": 12,
@@ -123,7 +123,7 @@ REPORT_DEFINITIONS = [
         "description": "Higher education student expenses and allowances",
         "parameter_type": "date_range",
         "required_parameters": ["from_date", "to_date"],
-        "example_query": "/reports/generate?report=students&format=json&from_date=01/01/2026&to_date=20/09/2026"
+        "example_args": {"report": "students", "format": "json", "from_date": "01/01/2026", "to_date": "20/09/2026"}
     },
     {
         "id": 13,
@@ -132,7 +132,7 @@ REPORT_DEFINITIONS = [
         "description": "Educational development budget statement",
         "parameter_type": "date_range",
         "required_parameters": ["from_date", "to_date"],
-        "example_query": "/reports/generate?report=studies_budget&format=json&from_date=01/01/2026&to_date=20/09/2026"
+        "example_args": {"report": "studies_budget", "format": "json", "from_date": "01/01/2026", "to_date": "20/09/2026"}
     },
     {
         "id": 14,
@@ -141,7 +141,7 @@ REPORT_DEFINITIONS = [
         "description": "Pharmacy & prescription medical charges",
         "parameter_type": "date_range",
         "required_parameters": ["from_date", "to_date"],
-        "example_query": "/reports/generate?report=pharmacy&format=json&from_date=01/01/2026&to_date=20/09/2026"
+        "example_args": {"report": "pharmacy", "format": "json", "from_date": "01/01/2026", "to_date": "20/09/2026"}
     },
     {
         "id": 16,
@@ -150,7 +150,7 @@ REPORT_DEFINITIONS = [
         "description": "Residential household electricity meter charges",
         "parameter_type": "date_range",
         "required_parameters": ["from_date", "to_date"],
-        "example_query": "/reports/generate?report=electricity&format=json&from_date=01/01/2026&to_date=20/09/2026"
+        "example_args": {"report": "electricity", "format": "json", "from_date": "01/01/2026", "to_date": "20/09/2026"}
     },
     {
         "id": 17,
@@ -159,7 +159,7 @@ REPORT_DEFINITIONS = [
         "description": "Eyeglasses and optical subsidies and charges",
         "parameter_type": "date_range",
         "required_parameters": ["from_date", "to_date"],
-        "example_query": "/reports/generate?report=eyeglasses&format=json&from_date=01/01/2026&to_date=20/09/2026"
+        "example_args": {"report": "eyeglasses", "format": "json", "from_date": "01/01/2026", "to_date": "20/09/2026"}
     },
     {
         "id": 18,
@@ -168,7 +168,7 @@ REPORT_DEFINITIONS = [
         "description": "Community sports, arts, and educational classes",
         "parameter_type": "date_range",
         "required_parameters": ["from_date", "to_date"],
-        "example_query": "/reports/generate?report=classes&format=json&from_date=01/01/2026&to_date=20/09/2026"
+        "example_args": {"report": "classes", "format": "json", "from_date": "01/01/2026", "to_date": "20/09/2026"}
     },
     {
         "id": 26,
@@ -177,7 +177,7 @@ REPORT_DEFINITIONS = [
         "description": "Kibbutz pub beverage and snack purchases by buyer",
         "parameter_type": "date_range",
         "required_parameters": ["from_date", "to_date"],
-        "example_query": "/reports/generate?report=pub_by_buyer&format=json&from_date=01/01/2026&to_date=20/09/2026"
+        "example_args": {"report": "pub_by_buyer", "format": "json", "from_date": "01/01/2026", "to_date": "20/09/2026"}
     },
     {
         "id": 27,
@@ -186,7 +186,7 @@ REPORT_DEFINITIONS = [
         "description": "Kibbutz pub purchases chronologically by date",
         "parameter_type": "date_range",
         "required_parameters": ["from_date", "to_date"],
-        "example_query": "/reports/generate?report=pub_by_date&format=json&from_date=01/01/2026&to_date=20/09/2026"
+        "example_args": {"report": "pub_by_date", "format": "json", "from_date": "01/01/2026", "to_date": "20/09/2026"}
     },
     {
         "id": 69,
@@ -195,7 +195,7 @@ REPORT_DEFINITIONS = [
         "description": "Resident accounting ledger card",
         "parameter_type": "date_range",
         "required_parameters": ["from_date", "to_date"],
-        "example_query": "/reports/generate?report=residents_ledger&format=json&from_date=01/01/2026&to_date=20/09/2026"
+        "example_args": {"report": "residents_ledger", "format": "json", "from_date": "01/01/2026", "to_date": "20/09/2026"}
     },
     {
         "id": 90,
@@ -204,7 +204,7 @@ REPORT_DEFINITIONS = [
         "description": "Residential water meter consumption statement",
         "parameter_type": "none",
         "required_parameters": [],
-        "example_query": "/reports/generate?report=water&format=json"
+        "example_args": {"report": "water", "format": "json"}
     }
 ]
 
@@ -302,7 +302,7 @@ class BudgetDriver:
 
     async def _login_client(self, client: httpx.AsyncClient, username: str, password: str):
         """Performs form login against ASP.NET MVC /Home/Login."""
-        logger.info(f"Authenticating session for user '{username}' on {config.BUDGET_BASE_URL}...")
+        logger.info("Authenticating budget session.")
         resp = await client.post(
             "/Home/Login?",
             data={
@@ -313,7 +313,7 @@ class BudgetDriver:
         
         # Check validation errors in returned HTML
         if "שם משתמש או סיסמא שגויים" in resp.text:
-            logger.warning(f"Login failed for user '{username}': incorrect credentials")
+            logger.warning("Budget authentication failed.")
             raise APIException(
                 status_code=401,
                 code="invalid_credentials",
@@ -327,7 +327,7 @@ class BudgetDriver:
                 message=f"Budget site returned HTTP {resp.status_code} during authentication."
             )
 
-        logger.info(f"User '{username}' authenticated successfully.")
+        logger.info("Budget authentication succeeded.")
 
     async def check_login_status(self, username: str, password: str) -> Tuple[bool, Optional[str]]:
         """Verifies if the credentials are valid and active."""
@@ -341,8 +341,8 @@ class BudgetDriver:
             if "UserName" in resp.text and "Password" in resp.text and "התחבר" in resp.text:
                 return False, None
             return True, username
-        except Exception as e:
-            logger.warning(f"check_login_status failed: {e}")
+        except Exception:
+            logger.warning("Budget login status check failed.")
             return False, None
 
     async def get_balance(self, username: str, password: str) -> Dict[str, Any]:

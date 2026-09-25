@@ -3,6 +3,7 @@ user_data/
 __pycache__/
 *.pyc
 .pytest_cache/
+maaganm_email.sqlite3*
 .env
 .env.local
 .env.*.local
