@@ -11,4 +11,3 @@ maaganm_email.sqlite3*
 .current_jwt
 feedback.jsonl
 .DS_Store
-poll_github.py
