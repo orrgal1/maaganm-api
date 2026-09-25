@@ -80,6 +80,7 @@ def scheduler_page(
     *,
     token: str = "synthetic-csrf",
     include_token: bool = True,
+    update_ui: bool = False,
 ) -> str:
     fields = {
         "ScheduleViewModel.CallId": call_id,
@@ -125,8 +126,17 @@ def scheduler_page(
         if current is not None
         else None
     )
+    submit_controls = (
+        '<p>בחירת מועד חדש תבטל את המועד הנוכחי.</p>'
+        '<button id="btnSubmitSchedule" type="submit">עדכון מועד</button>'
+        f'<button type="submit" formaction="/ScheduleAppointment/{call_id}?handler=Cancel" '
+        'formnovalidate>ביטול תיאום</button>'
+        if update_ui
+        else ""
+    )
+    update_form = f'<form method="post">{controls}{submit_controls}</form>'
     return f"""<!doctype html><html><body>
-      <form method="post">{controls}</form>
+      {update_form}
       <script>
         const availableSlots = {json.dumps(available)};
         const currentSlotEvent = {json.dumps(current_event)};
@@ -915,11 +925,241 @@ async def test_scheduler_response_size_limit_is_enforced():
     driver, client, _ = make_driver(
         (oversized, {"content-type": "text/html; charset=utf-8"})
     )
-
     try:
         with pytest.raises(APIException) as raised:
             await driver.get_schedule_options("12345")
     finally:
         await client.aclose()
-
     assert raised.value.code == "help_portal_invalid_response"
+
+@pytest.mark.asyncio
+async def test_replacement_read_redacts_scheduler_internals_and_reports_current():
+    available = schedule_slot(
+        "synthetic-replacement-event",
+        "2026-10-06T12:00:00",
+        "2026-10-06T13:00:00",
+    )
+    current = schedule_slot(
+        "synthetic-current-event",
+        "2026-10-05T09:00:00",
+        "2026-10-05T10:00:00",
+        available=False,
+        current=True,
+    )
+    driver, client, _ = make_driver(
+        portal_page(call_row("12345")),
+        scheduler_page("12345", [available, current], update_ui=True),
+    )
+    try:
+        result = await driver.get_schedule_replacements(MEMBER, "12345")
+    finally:
+        await client.aclose()
+
+    assert result["call_id"] == "12345"
+    assert result["scheduling"] == {"mode": "calendar"}
+    assert result["appointment"] == {
+        "start": "2026-10-05T09:00:00",
+        "end": "2026-10-05T10:00:00",
+        "status": "scheduled",
+    }
+    assert result["replacement_slots"][0]["start"] == "2026-10-06T12:00:00"
+    serialized = json.dumps(result)
+    assert "synthetic-replacement-event" not in serialized
+    assert "synthetic-csrf" not in serialized
+
+
+@pytest.mark.asyncio
+async def test_replacement_read_reports_assigned_mode_for_noncalendar_call():
+    before = portal_page(call_row("12345", handler="Assigned handler"))
+    driver, client, _ = make_driver(
+        before,
+        {
+            "status": 302,
+            "headers": {"location": "https://scheduler.invalid/Error"},
+        },
+        "<html><body>Unsupported</body></html>",
+    )
+    try:
+        result = await driver.get_schedule_replacements(MEMBER, "12345")
+    finally:
+        await client.aclose()
+
+    assert result == {
+        "call_id": "12345",
+        "scheduling": {"mode": "assigned", "handler": "Assigned handler"},
+    }
+
+
+@pytest.mark.asyncio
+async def test_replacement_read_reports_unknown_mode_without_scheduler_slots():
+    empty_handler = """
+      <tr><td><form>
+        <input name="callid" value="12345">
+        <input name="callisopen" value="1">
+        <input name="callopened" value="2026-01-02 03:04">
+        <input name="calldescription" value="Fixture request">
+        <input name="callnote" value="Initial note">
+      </form></td></tr>
+    """
+    driver, client, _ = make_driver(
+        portal_page(empty_handler),
+        {
+            "status": 302,
+            "headers": {"location": "https://scheduler.invalid/Error"},
+        },
+        "<html><body>Unsupported</body></html>",
+    )
+    try:
+        result = await driver.get_schedule_replacements(MEMBER, "12345")
+    finally:
+        await client.aclose()
+
+    assert result == {
+        "call_id": "12345",
+        "scheduling": {"mode": "unknown"},
+    }
+
+
+@pytest.mark.asyncio
+async def test_move_freshly_resolves_opaque_slot_posts_update_form_and_confirms():
+    selected = schedule_slot(
+        "synthetic-move-event",
+        "2026-10-08T12:00:00",
+        "2026-10-08T13:00:00",
+    )
+    confirmed = schedule_slot(
+        "synthetic-move-event",
+        "2026-10-08T12:00:00",
+        "2026-10-08T13:00:00",
+        available=False,
+        current=True,
+    )
+    original = schedule_slot(
+        "synthetic-current-event",
+        "2026-10-05T09:00:00",
+        "2026-10-05T10:00:00",
+        available=False,
+        current=True,
+    )
+    driver, client, transport = make_driver(
+        portal_page(call_row("12345")),
+        scheduler_page("12345", [selected, original], update_ui=True),
+        portal_page(call_row("12345")),
+        scheduler_page(
+            "12345",
+            [selected, original],
+            token="fresh-token",
+            update_ui=True,
+        ),
+        "<html><body>עודכן</body></html>",
+        scheduler_page("12345", [confirmed], token="confirmed-token", update_ui=True),
+    )
+    try:
+        options = await driver.get_schedule_replacements(MEMBER, "12345")
+        result = await driver.move_schedule(MEMBER, "12345", options["replacement_slots"][0]["id"])
+    finally:
+        await client.aclose()
+
+    assert [request.method for request in transport.requests] == [
+        "POST",
+        "GET",
+        "POST",
+        "GET",
+        "POST",
+        "GET",
+    ]
+    posted = parse_qs(transport.requests[4].content.decode("utf-8"), keep_blank_values=True)
+    assert posted["ScheduleViewModel.CallId"] == ["12345"]
+    assert posted["ScheduleViewModel.SelectedEventId"] == ["synthetic-move-event"]
+    assert posted["__RequestVerificationToken"] == ["fresh-token"]
+    assert "btnSubmitSchedule" not in posted
+    assert result == {
+        "call_id": "12345",
+        "appointment": {
+            "id": options["replacement_slots"][0]["id"],
+            "start": "2026-10-08T12:00:00",
+            "end": "2026-10-08T13:00:00",
+            "status": "scheduled",
+        },
+        "status": "rescheduled",
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "page",
+    [
+        scheduler_page("12345", [], update_ui=True),
+        scheduler_page(
+            "12345",
+            [
+                schedule_slot(
+                    "synthetic-no-update",
+                    "2026-10-08T12:00:00",
+                    "2026-10-08T13:00:00",
+                ),
+                schedule_slot(
+                    "synthetic-current",
+                    "2026-10-05T09:00:00",
+                    "2026-10-05T10:00:00",
+                    available=False,
+                    current=True,
+                ),
+            ],
+        ),
+    ],
+)
+async def test_move_refuses_without_current_or_update_evidence_before_post(page):
+    driver, client, transport = make_driver(
+        portal_page(call_row("12345")),
+        page,
+    )
+    try:
+        with pytest.raises(APIException) as raised:
+            await driver.move_schedule(MEMBER, "12345", "0" * 64)
+    finally:
+        await client.aclose()
+    assert raised.value.code == "help_reschedule_unavailable"
+    assert [request.method for request in transport.requests] == ["POST", "GET"]
+
+
+@pytest.mark.asyncio
+async def test_move_refuses_noncalendar_call_without_mutation_post():
+    driver, client, transport = make_driver(
+        portal_page(call_row("12345", handler="Assigned handler")),
+        {
+            "status": 302,
+            "headers": {"location": "https://scheduler.invalid/Error"},
+        },
+        "<html><body>Unsupported</body></html>",
+    )
+    try:
+        with pytest.raises(APIException) as raised:
+            await driver.move_schedule(MEMBER, "12345", "0" * 64)
+    finally:
+        await client.aclose()
+    assert raised.value.code == "help_reschedule_unavailable"
+    assert [request.method for request in transport.requests] == [
+        "POST",
+        "GET",
+        "GET",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_booking_refuses_call_with_existing_current_appointment():
+    current = schedule_slot(
+        "synthetic-existing", "2026-10-05T09:00:00", "2026-10-05T10:00:00",
+        available=False, current=True,
+    )
+    available = schedule_slot(
+        "synthetic-new", "2026-10-08T12:00:00", "2026-10-08T13:00:00",
+    )
+    driver, client, transport = make_driver(scheduler_page("12345", [current, available]))
+    try:
+        with pytest.raises(APIException) as raised:
+            await driver.book_schedule("12345", "0" * 64)
+    finally:
+        await client.aclose()
+    assert raised.value.code == "help_schedule_already_booked"
+    assert [request.method for request in transport.requests] == ["GET"]

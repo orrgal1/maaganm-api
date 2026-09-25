@@ -44,7 +44,9 @@ The driver mapping and command arguments are:
 | `help.catalog` | read | `get_catalog` | not required | `{}` |
 | `help.calls.list` | read | `list_calls` | not required | `{}` |
 | `help.call.schedule.options` | read | `get_schedule_options` | not required | exactly `{"call_id":"<nonempty string>"}` |
+| `help.call.schedule.replacements` | read | `get_schedule_replacements` | not required | exactly `{"call_id":"<nonempty string>"}` |
 | `help.call.schedule.book` | write | `book_schedule` | required | exactly `{"call_id":"<nonempty string>","slot_id":"<nonempty string>"}` |
+| `help.call.schedule.move` | write | `move_schedule` | required | exactly `{"call_id":"<nonempty string>","slot_id":"<nonempty string>"}` |
 | `transfer.stage` | write | `transfer` | required | `recipient_hid`, `recipient_name`, `amount_ils`, `details_receiver` (optional), `details_sender` (optional), `transaction_type` (integer, optional; default 1) |
 | `transfer.approve` | write | `approve_otp` | required | `transaction_id`, `otp_code` |
 | `transaction.delete` | write | `cancel_transaction` | required | `transaction_line_id` |
@@ -72,15 +74,40 @@ Creation and calendar scheduling use a strict create → options → book flow:
    `{"call_id":"<nonempty string>","slot_id":"<nonempty string>"}`. Booking is
    a separate write and must pass its own approval and expiry gate; approval
    for creation does not approve booking. Request-ID idempotency still applies
-   to the booking command.
+   to the booking command. An already-booked call is refused by this operation.
+
+To reschedule an existing calendar appointment, use a replacement-slots then
+approved-move flow:
+
+1. Send `help.call.schedule.replacements` with exactly
+   `{"call_id":"<nonempty string>"}`. This read needs no approval. For a
+   calendar call it returns the `call_id`, `scheduling:{"mode":"calendar"}`,
+   the current `appointment` (`start`, `end`, `status:"scheduled"`), and
+   `replacement_slots` with opaque IDs. The response exposes no event IDs or
+   CSRF values; use each opaque `slot_id` exactly as returned.
+2. Send `help.call.schedule.move` with exactly
+   `{"call_id":"<nonempty string>","slot_id":"<nonempty string>"}` and an
+   unexpired approval. The worker re-fetches current state, requires an
+   existing current appointment and portal evidence that the appointment is
+   for the same call, posts the same-call update, and re-fetches to confirm.
+   Success returns the `call_id`, the selected public `appointment`
+   (`id`, `start`, `end`, `status:"scheduled"`), and top-level
+   `status:"rescheduled"`. Request-ID idempotency and approval expiry apply.
+   The move operation does not cancel and create a new call: the observed
+   booked-call page provides a same-call POST update control and explicitly
+   says that choosing a new time cancels the current time.
+3. A non-calendar call is not treated as reschedulable: its response contains
+   the `call_id` and its actual coordination mode (`assigned` with a handler,
+   or `unknown`) and no `replacement_slots`.
+
 Scheduling metadata is documented only where observed: category `616` yields
 `"scheduling":{"mode":"calendar"}`; category `624` yields
 `"scheduling":{"mode":"contact","phone":"077-7076023","extension":"2"}`. Every
 other category yields `"scheduling":{"mode":"unknown"}`; no other
-classification is supported. When creation follows a scheduler redirect, its
-result includes `"scheduling":{"mode":"calendar","call_id":"..."}`. A normal
-creation includes `"scheduling":{"mode":"assigned","handler":"..."}` only for
-a nonempty handler and includes `"scheduling":{"mode":"unknown"}` otherwise.
+classification is supported. When creation follows a scheduler redirect, its result includes
+`"scheduling":{"mode":"calendar","call_id":"..."}`. A normal creation includes
+`"scheduling":{"mode":"assigned","handler":"..."}` only for a nonempty handler
+and includes `"scheduling":{"mode":"unknown"}` otherwise.
 These modes do not imply that creation booked a slot.
 
 Unknown verbs and unknown/malformed arguments fail closed. Binary report results are encoded as base64 in `payload`, together with `media_type` and `filename`; JSON reports remain structured JSON.

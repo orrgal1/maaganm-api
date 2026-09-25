@@ -80,6 +80,7 @@ class _SchedulePage:
     form_values: dict[str, str]
     slots: list[_ScheduleSlot]
     current: Optional[_CurrentScheduleSlot]
+    supports_move: bool
 
 class HelpPortalDriver:
     """Async driver for the service-center HTML form application."""
@@ -201,10 +202,123 @@ class HelpPortalDriver:
             result["current"] = _public_current_schedule_slot(page.current)
         return result
 
+    async def get_schedule_replacements(
+        self,
+        member_id: Any,
+        call_id: str,
+    ) -> dict[str, Any]:
+        target_id = _validated_schedule_call_id(call_id)
+        call = self._find_call(await self._fetch_page(member_id), target_id)
+        schedule = await self._fetch_optional_schedule_page(target_id)
+        if schedule is None or schedule.form_values["ScheduleViewModel.StrmCode"] != "616":
+            return {
+                "call_id": target_id,
+                "scheduling": _call_scheduling(call),
+            }
+        if (
+            not call.public["is_open"]
+            or schedule.current is None
+            or not schedule.supports_move
+        ):
+            raise _error(
+                400,
+                "help_reschedule_unavailable",
+                "The appointment cannot be rescheduled.",
+            )
+        return {
+            "call_id": target_id,
+            "scheduling": {"mode": "calendar"},
+            "appointment": {
+                **_public_current_schedule_slot(schedule.current),
+                "status": "scheduled",
+            },
+            "replacement_slots": [
+                _public_schedule_slot(slot) for slot in schedule.slots
+            ],
+        }
+
+    async def move_schedule(
+        self,
+        member_id: Any,
+        call_id: str,
+        slot_id: str,
+    ) -> dict[str, Any]:
+        target_id = _validated_schedule_call_id(call_id)
+        target_slot_id = _validated_public_slot_id(slot_id)
+        call = self._find_call(await self._fetch_page(member_id), target_id)
+        fresh = await self._fetch_optional_schedule_page(target_id)
+        if (
+            not call.public["is_open"]
+            or fresh is None
+            or fresh.form_values["ScheduleViewModel.StrmCode"] != "616"
+            or fresh.current is None
+            or not fresh.supports_move
+        ):
+            raise _error(
+                400,
+                "help_reschedule_unavailable",
+                "The appointment cannot be rescheduled.",
+            )
+        selected = next(
+            (slot for slot in fresh.slots if _schedule_slot_id(slot) == target_slot_id),
+            None,
+        )
+        if selected is None or (
+            selected.start == fresh.current.start and selected.end == fresh.current.end
+        ):
+            raise _error(
+                400,
+                "help_schedule_slot_unavailable",
+                "The requested appointment slot is unavailable.",
+            )
+
+        payload = dict(fresh.form_values)
+        payload["ScheduleViewModel.SelectedStartTime"] = selected.start
+        payload["ScheduleViewModel.SelectedEndTime"] = selected.end
+        payload["ScheduleViewModel.SelectedEventId"] = selected.source_event_id
+        await self._request(
+            "POST",
+            self._schedule_path(target_id),
+            scheduler=True,
+            content=urlencode(payload).encode("utf-8"),
+            headers={"Content-Type": "application/x-www-form-urlencoded; charset=utf-8"},
+        )
+
+        confirmed = await self._fetch_optional_schedule_page(target_id)
+        current = confirmed.current if confirmed is not None else None
+        if (
+            confirmed is None
+            or not confirmed.supports_move
+            or current is None
+            or current.start != selected.start
+            or current.end != selected.end
+        ):
+            raise _error(
+                502,
+                "help_write_unconfirmed",
+                "The service-center change could not be confirmed.",
+            )
+        return {
+            "call_id": target_id,
+            "appointment": {
+                "id": target_slot_id,
+                **_public_current_schedule_slot(current),
+                "status": "scheduled",
+            },
+            "status": "rescheduled",
+        }
+
+
     async def book_schedule(self, call_id: str, slot_id: str) -> dict[str, Any]:
         target_id = _validated_schedule_call_id(call_id)
         target_slot_id = _validated_public_slot_id(slot_id)
         fresh = await self._fetch_schedule_page(target_id)
+        if fresh.current is not None:
+            raise _error(
+                400,
+                "help_schedule_already_booked",
+                "The service call already has an appointment.",
+            )
         selected = next(
             (slot for slot in fresh.slots if _schedule_slot_id(slot) == target_slot_id),
             None,
@@ -297,11 +411,25 @@ class HelpPortalDriver:
         return self._parse_page(response.content, response.content_type)
 
     async def _fetch_schedule_page(self, call_id: str) -> _SchedulePage:
+        page = await self._fetch_optional_schedule_page(call_id)
+        if page is None:
+            raise _invalid_response()
+        return page
+
+    async def _fetch_optional_schedule_page(
+        self,
+        call_id: str,
+    ) -> Optional[_SchedulePage]:
         response = await self._request(
             "GET",
             self._schedule_path(call_id),
             scheduler=True,
         )
+        final_path = urlsplit(response.final_url).path.rstrip("/")
+        if final_path == "/Error":
+            return None
+        if final_path != self._schedule_path(call_id).rstrip("/"):
+            raise _invalid_response()
         return self._parse_schedule_page(response.content, response.content_type, call_id)
 
     async def _request(
@@ -386,6 +514,20 @@ class HelpPortalDriver:
             )
         return candidates[0]
 
+    @staticmethod
+    def _find_call(page: _Page, call_id: str) -> _CallRecord:
+        call = next(
+            (record for record in page.calls if record.public["id"] == call_id),
+            None,
+        )
+        if call is None:
+            raise _error(
+                404,
+                "help_call_unavailable",
+                "The requested service call is unavailable.",
+            )
+        return call
+
     def _schedule_path(self, call_id: str) -> str:
         return f"{_SCHEDULER_PATH_PREFIX}{call_id}"
 
@@ -455,7 +597,8 @@ class HelpPortalDriver:
         if raw_current is not None:
             current_keys = {"id", "start", "end", "isCurrent", "isAvailable", "editable"}
             if (
-                not current_keys.issubset(raw_current)
+                not isinstance(raw_current, dict)
+                or not current_keys.issubset(raw_current)
                 or raw_current.get("id") != "__current_slot__"
                 or not isinstance(raw_current.get("start"), str)
                 or not raw_current["start"]
@@ -467,7 +610,26 @@ class HelpPortalDriver:
             ):
                 raise _invalid_response()
             current = _CurrentScheduleSlot(start=raw_current["start"], end=raw_current["end"])
-        return _SchedulePage(form_values=form_values, slots=slots, current=current)
+
+        update_control = form.find(id="btnSubmitSchedule")
+        form_action = str(form.get("action", "")).strip()
+        form_action_path = urlsplit(form_action).path if form_action else self._schedule_path(call_id)
+        supports_move = bool(
+            current is not None
+            and str(form.get("method", "get")).strip().lower() == "post"
+            and form_action_path == self._schedule_path(call_id)
+            and update_control is not None
+            and not update_control.get("formaction")
+            and _normalize_text(update_control.get_text(" ", strip=True)) == "עדכון מועד"
+            and "בחירת מועד חדש תבטל את המועד הנוכחי"
+            in _normalize_text(form.get_text(" ", strip=True))
+        )
+        return _SchedulePage(
+            form_values=form_values,
+            slots=slots,
+            current=current,
+            supports_move=supports_move,
+        )
 
     def _parse_page(self, content: bytes, content_type: str) -> _Page:
         soup = BeautifulSoup(_decode_html(content, content_type), "html.parser")
@@ -747,6 +909,13 @@ def _public_schedule_slot(slot: _ScheduleSlot) -> dict[str, str]:
 
 def _public_current_schedule_slot(slot: _CurrentScheduleSlot) -> dict[str, str]:
     return {"start": slot.start, "end": slot.end}
+
+
+def _call_scheduling(call: _CallRecord) -> dict[str, str]:
+    handler = _normalize_text(call.public.get("handler", ""))
+    if handler:
+        return {"mode": "assigned", "handler": handler}
+    return {"mode": "unknown"}
 
 
 def _category_scheduling(category_id: str) -> dict[str, str]:

@@ -337,10 +337,20 @@ class HelpCallScheduleOptionsCommand(_CommandBase):
     verb: Literal["help.call.schedule.options"]
     args: HelpCallIdArgs
 
+class HelpCallScheduleReplacementsCommand(_CommandBase):
+    verb: Literal["help.call.schedule.replacements"]
+    args: HelpCallIdArgs
+
+
 
 class HelpCallScheduleBookCommand(_CommandBase):
     verb: Literal["help.call.schedule.book"]
     args: HelpCallScheduleBookArgs
+
+class HelpCallScheduleMoveCommand(_CommandBase):
+    verb: Literal["help.call.schedule.move"]
+    args: HelpCallScheduleBookArgs
+
 
 
 Command = Annotated[
@@ -366,7 +376,9 @@ Command = Annotated[
         HelpCallCloseCommand,
         HelpCallReopenCommand,
         HelpCallScheduleOptionsCommand,
+        HelpCallScheduleReplacementsCommand,
         HelpCallScheduleBookCommand,
+        HelpCallScheduleMoveCommand,
     ],
     Field(discriminator="verb"),
 ]
@@ -402,7 +414,9 @@ VERBS: Mapping[str, VerbSpec] = MappingProxyType(
         "help.call.close": VerbSpec("write", HelpCallIdArgs),
         "help.call.reopen": VerbSpec("write", HelpCallIdArgs),
         "help.call.schedule.options": VerbSpec("read", HelpCallIdArgs),
+        "help.call.schedule.replacements": VerbSpec("read", HelpCallIdArgs),
         "help.call.schedule.book": VerbSpec("write", HelpCallScheduleBookArgs),
+        "help.call.schedule.move": VerbSpec("write", HelpCallScheduleBookArgs),
     }
 )
 READ_VERBS = frozenset(verb for verb, spec in VERBS.items() if spec.kind == "read")
@@ -619,7 +633,9 @@ class HelpPortalDriverProtocol(Protocol):
     async def get_catalog(self, member_id: str) -> dict[str, Any]: ...
     async def list_calls(self, member_id: str) -> list[dict[str, Any]]: ...
     async def get_schedule_options(self, call_id: str) -> dict[str, Any]: ...
+    async def get_schedule_replacements(self, member_id: str, call_id: str) -> dict[str, Any]: ...
     async def book_schedule(self, call_id: str, slot_id: str) -> dict[str, Any]: ...
+    async def move_schedule(self, member_id: str, call_id: str, slot_id: str) -> dict[str, Any]: ...
     async def create_call(
         self,
         member_id: str,
@@ -824,9 +840,28 @@ async def _invoke_driver(
     if isinstance(command, HelpCallScheduleOptionsCommand):
         portal = _require_help_driver(help_driver)
         return await portal.get_schedule_options(call_id=args.call_id)
+    if isinstance(command, HelpCallScheduleReplacementsCommand):
+        portal, member_id = _require_help_dependencies(
+            help_driver,
+            help_member_id,
+        )
+        return await portal.get_schedule_replacements(
+            member_id,
+            call_id=args.call_id,
+        )
     if isinstance(command, HelpCallScheduleBookCommand):
         portal = _require_help_driver(help_driver)
         return await portal.book_schedule(
+            call_id=args.call_id,
+            slot_id=args.slot_id,
+        )
+    if isinstance(command, HelpCallScheduleMoveCommand):
+        portal, member_id = _require_help_dependencies(
+            help_driver,
+            help_member_id,
+        )
+        return await portal.move_schedule(
+            member_id,
             call_id=args.call_id,
             slot_id=args.slot_id,
         )
