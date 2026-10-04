@@ -24,6 +24,33 @@ fields:
 
 Completed Budget and help results replay only when both the request ID and locally configured Budget username match. This preserves safe replay of previously scoped requests for the same account. A request ID previously used by another username, or one created before account scoping was added, returns HTTP 409 with `Request ID is unavailable`; use a fresh ID. A retry with the same username can replay after a password change. Keep request IDs unique across those operations because an ID is never re-executed, even if its verb or arguments differ. Help commands use the locally provisioned `HELP_MEMBER_ID`.
 
+### Transfer OTP step
+
+`transfer.stage` is a write command and requires its own unexpired `approval`.
+Inspect its result before taking another action:
+
+- If `payload.requires_otp` is `true`, the result has
+  `payload.status: "pending_otp"` and a `payload.transaction_id`. After receiving
+  the SMS code, send a separate `transfer.approve` write command with
+  `args: {"transaction_id":"<id from stage>","otp_code":"<nonempty SMS code>"}`,
+  a new request ID, and its own unexpired `approval`. An omitted, empty, or
+  whitespace-only `otp_code` is rejected with HTTP 400 before dispatch.
+- If the submission response does not establish the OTP state, the stage result
+  reports `payload.status: "submission_unverified"` and
+  `payload.requires_otp: null`. Check `transactions.list` before retrying the
+  transfer. An HTTP 200 from the budget site alone does not prove that the
+  transfer succeeded or that no OTP step remains.
+
+For an existing transaction with `can_approve: true`, use its
+`approval_transaction_id` as the `approval_transaction_id` argument for
+`transfer.otp.request`, or as the `transaction_id` argument for
+`transfer.approve`. The legacy `transactions.list.transaction_id` field
+represents the transaction line and is not the ID used by the site's approval
+form. Request or resend a code with `transfer.otp.request` when needed. Only
+call `transfer.approve` after you have its SMS code. Each OTP write needs its
+own unexpired `approval`; `otp_code` is the separate SMS verification code
+required by the budget service.
+
 ## Kehila-Net member reads
 
 Two read-only commands use the locally configured Kehila-Net account and the
@@ -113,7 +140,8 @@ The driver mapping and command arguments are:
 | `help.call.schedule.book` | write | `book_schedule` | required | exactly `{"call_id":"6457734","slot_id":"<nonempty string>"}` or the same object with integer `call_id` |
 | `help.call.schedule.move` | write | `move_schedule` | required | exactly `{"call_id":"6457734","slot_id":"<nonempty string>"}` or the same object with integer `call_id` |
 | `transfer.stage` | write | `transfer` | required | `recipient_hid`, `recipient_name`, `amount_ils`, `details_receiver` (optional), `details_sender` (optional), `transaction_type` (integer, optional; default 1) |
-| `transfer.approve` | write | `approve_otp` | required | `transaction_id`, `otp_code` |
+| `transfer.otp.request` | write | `request_otp` | required | `approval_transaction_id` (nonempty ID from `transactions.list.approval_transaction_id`) |
+| `transfer.approve` | write | `approve_otp` | required | `transaction_id` (nonempty approval ID from a pending OTP stage or `transactions.list.approval_transaction_id`), `otp_code` (nonempty SMS code) |
 | `transaction.delete` | write | `cancel_transaction` | required | `transaction_line_id` |
 | `approval.decline` | write | `decline_pending_approval` | required | `transaction_line_id` |
 | `authorized_user.set` | write | `set_authorized_user` | required | `user_id`, `user_name`, `is_authorized` (boolean) |

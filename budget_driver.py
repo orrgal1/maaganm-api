@@ -244,6 +244,7 @@ class BudgetDriver:
         self._mock_transactions = [
             {
                 "transaction_id": "90412",
+                "approval_transaction_id": "1420",
                 "display_id": "1420/90412",
                 "date": "18/09/2026",
                 "type": "העברה רגילה",
@@ -257,6 +258,7 @@ class BudgetDriver:
             },
             {
                 "transaction_id": "90380",
+                "approval_transaction_id": "1418",
                 "display_id": "1418/90380",
                 "date": "14/09/2026",
                 "type": "זיכוי מתקציב",
@@ -553,6 +555,7 @@ class BudgetDriver:
 
                 transactions.append({
                     "transaction_id": trx_id,
+                    "approval_transaction_id": disp_id or None,
                     "display_id": f"{disp_id}/{trx_id}" if disp_id else trx_id,
                     "date": date_str,
                     "type": "העברה",
@@ -637,10 +640,42 @@ class BudgetDriver:
             )
 
         return {
-            "status": "submitted",
+            "status": "submission_unverified",
             "transaction_id": None,
-            "requires_otp": False,
-            "message": "Transfer submitted successfully."
+            "requires_otp": None,
+            "message": "Submission outcome is unverified. Inspect transactions.list before retrying."
+        }
+
+    async def request_otp(
+        self,
+        username: str,
+        password: str,
+        approval_transaction_id: str
+    ) -> Dict[str, Any]:
+        """Requests a new code using the site's ApproveTransaction resend form."""
+        if config.MOCK_MODE:
+            return {
+                "status": "otp_request_submitted",
+                "approval_transaction_id": approval_transaction_id,
+                "message": "A new code was requested. Delivery is not verified."
+            }
+
+        await self._pending_approval_row(username, password, approval_transaction_id)
+        client = await self.get_client(username, password)
+        resp = await client.post(
+            "/Budget/GetNewPassword",
+            data={"TransactionId": approval_transaction_id}
+        )
+        if resp.status_code >= 400:
+            raise APIException(
+                status_code=502,
+                code="upstream_error",
+                message=f"Code request failed with HTTP {resp.status_code}"
+            )
+        return {
+            "status": "otp_request_submitted",
+            "approval_transaction_id": approval_transaction_id,
+            "message": "A new code was requested. Delivery is not verified."
         }
 
     async def approve_otp(
@@ -667,6 +702,7 @@ class BudgetDriver:
             }
 
         client = await self.get_client(username, password)
+        await self._pending_approval_row(username, password, transaction_id)
         resp = await client.post(
             "/Budget/ApproveTransaction",
             data={
@@ -675,19 +711,62 @@ class BudgetDriver:
             }
         )
 
-        if "אושרה" in resp.text or resp.status_code == 200:
+        if resp.status_code >= 400:
+            raise APIException(
+                status_code=502,
+                code="upstream_error",
+                message=f"Code confirmation failed with HTTP {resp.status_code}"
+            )
+
+        # A 200 may be the same OTP form with a validation error. Only the
+        # subsequent transaction state can establish that approval completed.
+        try:
+            rows = await self.get_transactions(username, password)
+        except Exception:
+            rows = []
+        matches = [row for row in rows if row.get("approval_transaction_id") == transaction_id]
+        if len(matches) == 1 and matches[0].get("status") in {"מאושר", "בוצע"} and not matches[0].get("can_approve"):
             pending_transfer_store.remove_transfer(transaction_id)
             return {
                 "status": "approved",
                 "transaction_id": transaction_id,
-                "message": f"Transfer {transaction_id} approved successfully."
+                "message": "The transaction table confirms the transfer was approved."
             }
+        return {
+            "status": "approval_unverified",
+            "transaction_id": transaction_id,
+            "message": "Code confirmation outcome is unverified. Inspect transactions.list before retrying."
+        }
 
-        raise APIException(
-            status_code=400,
-            code="otp_verification_failed",
-            message="OTP verification failed. Check code and try again."
-        )
+    async def _pending_approval_row(
+        self, username: str, password: str, approval_transaction_id: str
+    ) -> Dict[str, Any]:
+        """Fail closed before a write unless the live table identifies one OTP-pending row."""
+        rows = await self.get_transactions(username, password)
+        matches = [
+            row for row in rows
+            if row.get("approval_transaction_id") == approval_transaction_id
+        ]
+        if not matches:
+            raise APIException(
+                status_code=404,
+                code="transfer_not_found",
+                message="The approval transaction was not found in the current table."
+            )
+        if len(matches) != 1:
+            raise APIException(
+                status_code=409,
+                code="approval_state_ambiguous",
+                message="The approval transaction did not resolve to one row."
+            )
+        row = matches[0]
+        if row.get("status") != "ממתין לאישור" or row.get("can_approve") is not True:
+            raise APIException(
+                status_code=409,
+                code="transfer_not_approvable",
+                message="The transaction is not awaiting OTP approval."
+            )
+        return row
 
     async def cancel_transaction(
         self,

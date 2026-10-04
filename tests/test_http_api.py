@@ -4,6 +4,7 @@ import hmac
 import hashlib
 import sqlite3
 import uuid
+from datetime import datetime, timedelta, timezone
 
 import pytest
 from fastapi.testclient import TestClient
@@ -137,6 +138,55 @@ def test_local_credentials_reach_dispatch_for_read_and_write(tmp_path, monkeypat
         ("balance", "local-user", "local-password"),
         ("transfer.stage", "local-user", "local-password"),
     ]
+
+
+def test_transfer_approve_requires_nonempty_otp_before_dispatch(tmp_path, monkeypatch):
+    monkeypatch.setattr(http_api, "_store", RequestStore(tmp_path / "requests.sqlite3"))
+    dispatched = []
+
+    async def capture(command, driver, username, password, **kwargs):
+        dispatched.append(command)
+        return make_result(command.id, "ok", payload={"seen": command.verb})
+
+    monkeypatch.setattr(http_api, "dispatch_command", capture)
+    approval = {
+        "ref": "test-approval",
+        "expires_at": (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat(),
+    }
+
+    with TestClient(http_api.app) as client:
+        for args in (
+            {"transaction_id": "test-transaction"},
+            {"transaction_id": "test-transaction", "otp_code": ""},
+            {"transaction_id": "test-transaction", "otp_code": "   "},
+        ):
+            response = client.post(
+                "/commands",
+                headers=_headers(),
+                json={"id": str(uuid.uuid4()), "verb": "transfer.approve", "args": args, "approval": approval},
+            )
+            assert response.status_code == 400
+            assert response.json() == {
+                "detail": "transfer.approve requires a nonempty SMS otp_code"
+            }
+        assert dispatched == []
+
+        response = client.post(
+            "/commands",
+            headers=_headers(),
+            json={
+                "id": str(uuid.uuid4()),
+                "verb": "transfer.approve",
+                "args": {"transaction_id": "test-transaction", "otp_code": "123456"},
+                "approval": approval,
+            },
+        )
+    assert response.status_code == 200
+    assert response.json()["payload"] == {"seen": "transfer.approve"}
+    assert len(dispatched) == 1
+    assert dispatched[0].args.transaction_id == "test-transaction"
+    assert dispatched[0].args.otp_code == "123456"
+    assert dispatched[0].approval.ref == "test-approval"
 
 
 def test_live_startup_requires_local_credentials(monkeypatch):

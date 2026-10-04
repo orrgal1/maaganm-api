@@ -137,6 +137,13 @@ async def command(request: Request):
         payload = CommandInput.model_validate(supplied)
     except ValidationError:
         raise HTTPException(status_code=400, detail="Invalid command or arguments") from None
+    if payload.verb == "transfer.approve":
+        otp_code = payload.args.get("otp_code")
+        if "otp_code" not in payload.args or (isinstance(otp_code, str) and not otp_code.strip()):
+            raise HTTPException(
+                status_code=400,
+                detail="transfer.approve requires a nonempty SMS otp_code",
+            )
     data = payload.model_dump()
     data["issued_at"] = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
     # The retired mail worker's HMAC secret is not an HTTP API dependency.

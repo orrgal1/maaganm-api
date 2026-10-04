@@ -175,6 +175,10 @@ class TransferApproveArgs(StrictModel):
     otp_code: NonEmptyStr
 
 
+class TransferOtpRequestArgs(StrictModel):
+    approval_transaction_id: NonEmptyStr
+
+
 class TransactionDeleteArgs(StrictModel):
     transaction_line_id: NonEmptyStr
 
@@ -350,6 +354,11 @@ class TransferApproveCommand(_CommandBase):
     args: TransferApproveArgs
 
 
+class TransferOtpRequestCommand(_CommandBase):
+    verb: Literal["transfer.otp.request"]
+    args: TransferOtpRequestArgs
+
+
 class TransactionDeleteCommand(_CommandBase):
     verb: Literal["transaction.delete"]
     args: TransactionDeleteArgs
@@ -434,6 +443,7 @@ Command = Annotated[
         ReportsGenerateCommand,
         TransferStageCommand,
         TransferApproveCommand,
+        TransferOtpRequestCommand,
         TransactionDeleteCommand,
         ApprovalDeclineCommand,
         AuthorizedUserSetCommand,
@@ -475,6 +485,7 @@ VERBS: Mapping[str, VerbSpec] = MappingProxyType(
         "reports.generate": VerbSpec("read", ReportsGenerateArgs),
         "transfer.stage": VerbSpec("write", TransferStageArgs),
         "transfer.approve": VerbSpec("write", TransferApproveArgs),
+        "transfer.otp.request": VerbSpec("write", TransferOtpRequestArgs),
         "transaction.delete": VerbSpec("write", TransactionDeleteArgs),
         "approval.decline": VerbSpec("write", ApprovalDeclineArgs),
         "authorized_user.set": VerbSpec("write", AuthorizedUserSetArgs),
@@ -696,6 +707,7 @@ class BudgetDriverProtocol(Protocol):
     def get_report_types(self) -> list[dict[str, Any]]: ...
     async def generate_report(self, username: str, password: str, report: Any, format: str = "json", year: int | None = None, from_month: int | None = None, to_month: int | None = None, from_date: str | None = None, to_date: str | None = None) -> tuple[Any, str]: ...
     async def transfer(self, username: str, password: str, recipient_hid: str, recipient_name: str, amount_ils: float, details_receiver: str = "", details_sender: str = "", transaction_type: int = 1) -> dict[str, Any]: ...
+    async def request_otp(self, username: str, password: str, approval_transaction_id: str) -> dict[str, Any]: ...
     async def approve_otp(self, username: str, password: str, transaction_id: str, otp_code: str) -> dict[str, Any]: ...
     async def cancel_transaction(self, username: str, password: str, transaction_line_id: str) -> dict[str, Any]: ...
     async def decline_pending_approval(self, username: str, password: str, transaction_line_id: str) -> dict[str, Any]: ...
@@ -979,6 +991,12 @@ async def _invoke_driver(
             transaction_id=args.transaction_id,
             otp_code=args.otp_code,
         )
+    if isinstance(command, TransferOtpRequestCommand):
+        return await driver.request_otp(
+            username,
+            password,
+            approval_transaction_id=args.approval_transaction_id,
+        )
     if isinstance(command, TransactionDeleteCommand):
         return await driver.cancel_transaction(
             username,
@@ -1160,6 +1178,8 @@ def _safe_driver_message(code: str, *, is_help: bool = False, is_kehilanet: bool
         ),
         "transfer_failed": "The transfer could not be submitted.",
         "transfer_not_found": "The pending transfer was not found or has expired.",
+        "transfer_not_approvable": "The transfer is not awaiting OTP approval.",
+        "approval_state_ambiguous": "The transfer approval state could not be resolved safely.",
         "otp_verification_failed": "The transfer approval code was rejected.",
         "invalid_report_id": "The requested report is not supported.",
         "report_generation_failed": "The report could not be generated.",
