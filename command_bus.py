@@ -115,6 +115,16 @@ class RecipientSearchArgs(StrictModel):
     transaction_type: int = Field(default=1, ge=1)
 
 
+class KehilaPhonebookArgs(StrictModel):
+    query: NonEmptyStr = Field(max_length=120)
+    limit: int = Field(default=20, ge=1, le=50)
+
+
+class KehilaAnnouncementsArgs(StrictModel):
+    query: str = Field(default="", max_length=120)
+    limit: int = Field(default=10, ge=1, le=20)
+
+
 class TransactionsListArgs(StrictModel):
     from_date: NonEmptyStr | None = None
     to_date: NonEmptyStr | None = None
@@ -270,6 +280,16 @@ class RecipientsSearchCommand(_CommandBase):
     args: RecipientSearchArgs
 
 
+class KehilaPhonebookCommand(_CommandBase):
+    verb: Literal["kehilanet.phonebook.search"]
+    args: KehilaPhonebookArgs
+
+
+class KehilaAnnouncementsCommand(_CommandBase):
+    verb: Literal["kehilanet.announcements.list"]
+    args: KehilaAnnouncementsArgs
+
+
 class TransactionsListCommand(_CommandBase):
     verb: Literal["transactions.list"]
     args: TransactionsListArgs
@@ -379,6 +399,8 @@ Command = Annotated[
         HealthCommand,
         BalanceCommand,
         RecipientsSearchCommand,
+        KehilaPhonebookCommand,
+        KehilaAnnouncementsCommand,
         TransactionsListCommand,
         ApprovalsPendingCommand,
         AuthorizedUsersListCommand,
@@ -417,6 +439,8 @@ VERBS: Mapping[str, VerbSpec] = MappingProxyType(
         "health": VerbSpec("read", EmptyArgs),
         "balance": VerbSpec("read", EmptyArgs),
         "recipients.search": VerbSpec("read", RecipientSearchArgs),
+        "kehilanet.phonebook.search": VerbSpec("read", KehilaPhonebookArgs),
+        "kehilanet.announcements.list": VerbSpec("read", KehilaAnnouncementsArgs),
         "transactions.list": VerbSpec("read", TransactionsListArgs),
         "approvals.pending": VerbSpec("read", EmptyArgs),
         "authorized_users.list": VerbSpec("read", EmptyArgs),
@@ -680,6 +704,15 @@ class HelpPortalDriverProtocol(Protocol):
     ) -> dict[str, Any]: ...
 
 
+class KehilaNetDriverProtocol(Protocol):
+    async def search_phonebook(
+        self, username: str, password: str, *, query: str, limit: int
+    ) -> list[dict[str, Any]]: ...
+    async def list_announcements(
+        self, username: str, password: str, *, query: str, limit: int
+    ) -> list[dict[str, Any]]: ...
+
+
 async def dispatch_command(
     command: Command,
     driver: BudgetDriverProtocol,
@@ -688,6 +721,9 @@ async def dispatch_command(
     *,
     help_driver: HelpPortalDriverProtocol | None = None,
     help_member_id: str | None = None,
+    kehilanet_driver: KehilaNetDriverProtocol | None = None,
+    kehilanet_username: str | None = None,
+    kehilanet_password: str | None = None,
     now: datetime | None = None,
 ) -> CommandResult:
     """Safely dispatch a validated command to its explicitly mapped driver method."""
@@ -711,6 +747,7 @@ async def dispatch_command(
             )
 
     is_help_command = command.verb.startswith("help.")
+    is_kehilanet_command = command.verb.startswith("kehilanet.")
     try:
         payload = await _invoke_driver(
             command,
@@ -719,8 +756,11 @@ async def dispatch_command(
             password,
             help_driver=help_driver,
             help_member_id=help_member_id,
+            kehilanet_driver=kehilanet_driver,
+            kehilanet_username=kehilanet_username,
+            kehilanet_password=kehilanet_password,
         )
-        payload = _redact_values(payload, (username, password))
+        payload = _redact_values(payload, (username, password, kehilanet_username, kehilanet_password))
         return make_result(command.id, "ok", payload=payload, as_of=current_time)
     except APIException as exc:
         code = exc.code if isinstance(exc.code, str) and _SAFE_CODE_RE.fullmatch(exc.code) else "driver_error"
@@ -728,11 +768,11 @@ async def dispatch_command(
             command.id,
             "error",
             error_code=code,
-            error_message=_safe_driver_message(code, is_help=is_help_command),
+            error_message=_safe_driver_message(code, is_help=is_help_command, is_kehilanet=is_kehilanet_command),
             as_of=current_time,
         )
     except (ValidationError, TypeError, ValueError):
-        service = "help" if is_help_command else "budget"
+        service = "Kehila-Net" if is_kehilanet_command else ("help" if is_help_command else "budget")
         return make_result(
             command.id,
             "error",
@@ -741,7 +781,7 @@ async def dispatch_command(
             as_of=current_time,
         )
     except Exception:
-        service = "help" if is_help_command else "budget"
+        service = "Kehila-Net" if is_kehilanet_command else ("help" if is_help_command else "budget")
         return make_result(
             command.id,
             "error",
@@ -815,6 +855,9 @@ async def _invoke_driver(
     *,
     help_driver: HelpPortalDriverProtocol | None,
     help_member_id: str | None,
+    kehilanet_driver: KehilaNetDriverProtocol | None,
+    kehilanet_username: str | None,
+    kehilanet_password: str | None,
 ) -> Any:
     args = command.args
     if isinstance(command, HealthCommand):
@@ -830,6 +873,20 @@ async def _invoke_driver(
             transaction_type=args.transaction_type,
         )
         return _list_payload(items)
+    if isinstance(command, KehilaPhonebookCommand):
+        portal, portal_username, portal_password = _require_kehilanet_dependencies(
+            kehilanet_driver, kehilanet_username, kehilanet_password
+        )
+        return _list_payload(await portal.search_phonebook(
+            portal_username, portal_password, query=args.query, limit=args.limit
+        ))
+    if isinstance(command, KehilaAnnouncementsCommand):
+        portal, portal_username, portal_password = _require_kehilanet_dependencies(
+            kehilanet_driver, kehilanet_username, kehilanet_password
+        )
+        return _list_payload(await portal.list_announcements(
+            portal_username, portal_password, query=args.query, limit=args.limit
+        ))
     if isinstance(command, TransactionsListCommand):
         items = await driver.get_transactions(
             username,
@@ -1003,6 +1060,16 @@ def _require_help_driver(
     return help_driver
 
 
+def _require_kehilanet_dependencies(
+    driver: KehilaNetDriverProtocol | None,
+    username: str | None,
+    password: str | None,
+) -> tuple[KehilaNetDriverProtocol, str, str]:
+    if driver is None or not username or not password:
+        raise RuntimeError("Kehila-Net dependencies are not configured")
+    return driver, username, password
+
+
 def _require_help_dependencies(
     help_driver: HelpPortalDriverProtocol | None,
     help_member_id: str | None,
@@ -1026,7 +1093,7 @@ def _report_filename(report: str | int, report_format: str) -> str:
     return f"{stem}.{report_format}"
 
 
-def _redact_values(value: Any, secrets: tuple[str, ...]) -> Any:
+def _redact_values(value: Any, secrets: tuple[str | None, ...]) -> Any:
     protected = tuple(secret for secret in secrets if secret)
     if isinstance(value, str):
         for secret in protected:
@@ -1041,7 +1108,13 @@ def _redact_values(value: Any, secrets: tuple[str, ...]) -> Any:
     return value
 
 
-def _safe_driver_message(code: str, *, is_help: bool = False) -> str:
+def _safe_driver_message(code: str, *, is_help: bool = False, is_kehilanet: bool = False) -> str:
+    if is_kehilanet:
+        return {
+            "invalid_credentials": "Kehila-Net credentials were rejected.",
+            "upstream_error": "Kehila-Net could not complete the read.",
+            "driver_response_invalid": "Kehila-Net returned an unexpected page.",
+        }.get(code, "The Kehila-Net read failed.")
     messages = {
         "invalid_credentials": "Budget credentials were rejected.",
         "upstream_error": (

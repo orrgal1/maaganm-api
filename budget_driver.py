@@ -1,5 +1,8 @@
 import asyncio
+import hashlib
+import hmac
 import logging
+import os
 import re
 import csv
 import io
@@ -217,6 +220,7 @@ class BudgetDriver:
 
     def __init__(self):
         self._clients: Dict[str, httpx.AsyncClient] = {}
+        self._cache_key_secret = os.urandom(32)
         self._lock = asyncio.Lock()
         self._recipients_cache: Dict[str, Tuple[float, List[Dict[str, Any]]]] = {}
 
@@ -282,7 +286,7 @@ class BudgetDriver:
 
     async def get_client(self, username: str, password: str) -> httpx.AsyncClient:
         """Retrieves or creates an authenticated HTTP client for the given credentials."""
-        session_key = f"{username}:{password}"
+        session_key = self._session_key(username, password)
         async with self._lock:
             client = self._clients.get(session_key)
             if client is None or client.is_closed:
@@ -299,6 +303,10 @@ class BudgetDriver:
                 if not config.MOCK_MODE:
                     await self._login_client(client, username, password)
             return client
+
+    def _session_key(self, username: str, password: str) -> str:
+        credential_bytes = f"{len(username)}:{username}{password}".encode("utf-8")
+        return hmac.new(self._cache_key_secret, credential_bytes, hashlib.sha256).hexdigest()
 
     async def _login_client(self, client: httpx.AsyncClient, username: str, password: str):
         """Performs form login against ASP.NET MVC /Home/Login."""
@@ -433,7 +441,7 @@ class BudgetDriver:
             return results
 
         # Check in-memory cache (TTL: 1 hour)
-        cache_key = f"recipients_{transaction_type}"
+        cache_key = f"{self._session_key(username, password)}:recipients_{transaction_type}"
         now_ts = time.time()
         cached = self._recipients_cache.get(cache_key)
         all_recipients = None

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -26,11 +27,18 @@ class ClaimResult:
         return "in_progress"
 
 
+class AccountScopeMismatch(Exception):
+    """A request ID belongs to another account or an unscoped legacy record."""
+
+
 class RequestStore:
     """Persistent, atomic request claims and byte-identical result replay."""
 
     def __init__(self, path: str | Path):
         self.path = str(path)
+        descriptor = os.open(self.path, os.O_CREAT | os.O_RDWR, 0o600)
+        os.close(descriptor)
+        os.chmod(self.path, 0o600)
         self._initialize_schema()
 
     def _connect(self) -> sqlite3.Connection:
@@ -48,6 +56,7 @@ class RequestStore:
                     request_id TEXT PRIMARY KEY,
                     state TEXT NOT NULL CHECK (state IN ('in_progress', 'completed')),
                     result BLOB,
+                    account_scope TEXT,
                     claimed_at TEXT NOT NULL,
                     completed_at TEXT,
                     CHECK (
@@ -58,10 +67,13 @@ class RequestStore:
                 )
                 """
             )
+            columns = {row[1] for row in connection.execute("PRAGMA table_info(requests)")}
+            if "account_scope" not in columns:
+                connection.execute("ALTER TABLE requests ADD COLUMN account_scope TEXT")
         finally:
             connection.close()
 
-    def claim(self, request_id: str) -> ClaimResult:
+    def claim(self, request_id: str, *, account_scope: str | None = None) -> ClaimResult:
         """Atomically claim a new id, or return its immutable prior state/result."""
         if not isinstance(request_id, str) or not request_id.strip():
             raise ValueError("request_id must be a nonempty string")
@@ -71,24 +83,26 @@ class RequestStore:
             connection.execute("BEGIN IMMEDIATE")
             cursor = connection.execute(
                 """
-                INSERT INTO requests (request_id, state, claimed_at)
-                VALUES (?, 'in_progress', ?)
+                INSERT INTO requests (request_id, state, account_scope, claimed_at)
+                VALUES (?, 'in_progress', ?, ?)
                 ON CONFLICT(request_id) DO NOTHING
                 """,
-                (request_id, _utc_now()),
+                (request_id, account_scope, _utc_now()),
             )
             if cursor.rowcount == 1:
                 connection.commit()
                 return ClaimResult(claimed=True)
 
             row = connection.execute(
-                "SELECT state, result FROM requests WHERE request_id = ?",
+                "SELECT state, result, account_scope FROM requests WHERE request_id = ?",
                 (request_id,),
             ).fetchone()
             connection.commit()
             if row is None:
                 raise RuntimeError("request claim state disappeared")
-            state, stored_result = row
+            state, stored_result, stored_scope = row
+            if stored_scope != account_scope:
+                raise AccountScopeMismatch()
             if state == "completed":
                 return ClaimResult(claimed=False, result=bytes(stored_result))
             return ClaimResult(claimed=False, in_progress=True)
@@ -103,18 +117,22 @@ class RequestStore:
         self,
         request_id: str,
         result: CommandResult | Mapping[str, Any] | bytes,
+        *,
+        account_scope: str | None = None,
     ) -> bytes:
         """Permanently complete a claim; a prior completion always wins."""
         connection = self._connect()
         try:
             connection.execute("BEGIN IMMEDIATE")
             row = connection.execute(
-                "SELECT state, result FROM requests WHERE request_id = ?",
+                "SELECT state, result, account_scope FROM requests WHERE request_id = ?",
                 (request_id,),
             ).fetchone()
             if row is None:
                 raise KeyError("request was not claimed")
-            state, stored_result = row
+            state, stored_result, stored_scope = row
+            if stored_scope != account_scope:
+                raise AccountScopeMismatch()
             if state == "completed":
                 replay = bytes(stored_result)
                 connection.commit()

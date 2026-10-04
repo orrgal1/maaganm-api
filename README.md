@@ -1,8 +1,60 @@
-# MaaganM Gmail command-bus worker
+# MaaganM API
 
-This worker reads signed commands from a Gmail mailbox and executes the allowlisted operations against both the Maagan Michael budget portal and the help portal at `help.mmm.org.il`. Gmail is the command bus: there is no inbound service endpoint. The worker uses the installed `gapi` command-line tool through subprocess argument lists and stores durable processing state in SQLite.
+This service exposes a bearer-protected REST endpoint for the existing allowlisted command dispatcher on local port 8001. Remote access is through `https://ors-macbook-air.taila51d65.ts.net/maaganm-api/`: sign in at `/login`, then use the browser session cookie. The gateway injects its bearer token from `local-api-gateway/.env`; callers do not need the API token. The previous signed Gmail command worker remains in the repository for migration and rollback, but is retired and is not part of the current runtime.
 
-## Mail protocol
+Run `uvicorn http_api:app --host 127.0.0.1 --port 8001` with `BUDGET_USERNAME` and `BUDGET_PASSWORD` configured locally in `.env` or `.env.local`. The gateway supplies the service bearer token from its private `local-api-gateway/.env`. The service uses its local Budget credentials and retains authenticated Budget sessions in memory. The stable gateway URL remains the same after a pause or restart.
+
+## REST caller contract
+
+The remote gateway authenticates browser sessions with its `/login` form and
+injects the API bearer token. Direct local API requests use
+`Authorization: Bearer <MAAGANM_API_TOKEN>`. Send JSON with these top-level
+fields:
+
+```json
+{
+  "id": "<unique-request-id>",
+  "verb": "balance",
+  "args": {},
+  "approval": null
+}
+```
+
+`id` may be omitted to generate one, but callers should supply a stable ID for retries. `approval` is optional for reads and required for writes. Do not send Budget credentials in command bodies, arguments, URLs, or logs. The Budget driver uses the locally configured credentials and keeps authenticated sessions in memory.
+
+Completed Budget and help results replay only when both the request ID and locally configured Budget username match. This preserves safe replay of previously scoped requests for the same account. A request ID previously used by another username, or one created before account scoping was added, returns HTTP 409 with `Request ID is unavailable`; use a fresh ID. A retry with the same username can replay after a password change. Keep request IDs unique across those operations because an ID is never re-executed, even if its verb or arguments differ. Help commands use the locally provisioned `HELP_MEMBER_ID`.
+
+## Kehila-Net member reads
+
+Two read-only commands use the locally configured Kehila-Net account and the
+same bearer-protected `POST /commands` route:
+
+| Verb | `args` | Result item fields |
+|---|---|---|
+| `kehilanet.phonebook.search` | `query` (required nonempty string, up to 120 characters), `limit` (optional, 1–50; default 20) | `name`, `phones` (`label`, `number`), `emails` |
+| `kehilanet.announcements.list` | `query` (optional string, up to 120 characters; default empty for latest), `limit` (optional, 1–20; default 10) | `id`, `title`, `date`, `category`, `teaser`, `content`, `links` |
+
+For example, send `{"verb":"kehilanet.announcements.list","args":{"query":"ישיבה","limit":5}}`.
+Both return the standard command result with `payload.items` and
+`payload.total`. Announcement `content` and HTTPS `links` come from the full
+message view, rather than only its teaser. The portal is read through a local
+headless Chrome session because a plain HTTP login did not reliably reach the
+member announcements page. The service performs no Kehila-Net writes.
+
+Set `KEHILANET_USERNAME` and `KEHILANET_PASSWORD` only in the owner-only
+`.env.local`; they are never accepted in request bodies. Member directory and
+announcement results are live reads and are not saved in the command replay
+database. If the local credentials are missing, these commands return HTTP
+503. Portal errors return safe command errors without exposing member pages or
+credentials in logs.
+
+## Retired signed Gmail command worker (reference only)
+
+The following mail protocol, worker configuration, prerequisites, and commands
+describe retained migration/rollback functionality. This worker is not started
+by the current runtime; use the REST API above for current requests.
+
+### Mail protocol
 
 Commands are sent from **`orgal@mail.instinct.com`** to **`orrgal+agents+maaganm@gmail.com`** with subject:
 ```text
@@ -23,11 +75,11 @@ The JSON body has exactly this envelope shape (placeholders are illustrative and
 
 Only the four result statuses shown above are valid. Error text and logs must never contain credentials, the HMAC secret, or other secrets.
 
-### HMAC verification
+#### HMAC verification
 
 The secret is required at worker startup. To calculate the signature, remove `hmac` from the envelope, sort JSON object keys recursively as applicable to the canonical object, serialize with compact separators `(',', ':')` and `ensure_ascii=False`, then compute HMAC-SHA256. Compare signatures with a constant-time `compare_digest`; reject missing, malformed, or mismatched signatures. Do not place secrets in command or result payloads.
 
-### Allowlist and argument contracts
+#### Allowlist and argument contracts
 
 The driver mapping and command arguments are:
 
@@ -63,7 +115,7 @@ For all `help.call.schedule.*` commands, `call_id` accepts a JSON string of 1–
 The `reports.catalog` response includes transport-neutral `example_args` objects for each report. Pass one of those objects as the `args` value of a `reports.generate` command; they do not contain Gmail- or CLI-specific fields.
 For `help.call.create`, each attachment must be an object with a safe, nonempty `filename`, a safe, nonempty MIME `content_type`, and strictly valid base64 `content_base64`. The attachment list has at most 5 items, and the aggregate decoded attachment content is limited to 4 MiB.
 
-### Help-call scheduling
+#### Help-call scheduling
 
 Creation and calendar scheduling use a strict create → options → book flow:
 

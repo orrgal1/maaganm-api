@@ -11,6 +11,10 @@ BUDGET_BASE_URL = os.getenv("BUDGET_BASE_URL", "https://budget.mmm.org.il").rstr
 BUDGET_USERNAME = os.getenv("BUDGET_USERNAME", "")
 BUDGET_PASSWORD = os.getenv("BUDGET_PASSWORD", "")
 
+# Kehila-Net member portal credentials, provisioned only on this Mac.
+KEHILANET_USERNAME = os.getenv("KEHILANET_USERNAME", "")
+KEHILANET_PASSWORD = os.getenv("KEHILANET_PASSWORD", "")
+
 # Help service member and endpoints
 HELP_BASE_URL = os.getenv("HELP_BASE_URL", "https://help.mmm.org.il").rstrip("/")
 HELP_SCHEDULER_BASE_URL = os.getenv(

@@ -4,6 +4,7 @@ __pycache__/
 *.pyc
 .pytest_cache/
 maaganm_email.sqlite3*
+maaganm_http.sqlite3*
 .env
 .env.local
 .env.*.local
@@ -11,3 +12,7 @@ maaganm_email.sqlite3*
 .current_jwt
 feedback.jsonl
 .DS_Store
+.api_token
+.discovery_secret
+.discovery.sqlite3*
+.runtime/
