@@ -32,14 +32,25 @@ same bearer-protected `POST /commands` route:
 | Verb | `args` | Result item fields |
 |---|---|---|
 | `kehilanet.phonebook.search` | `query` (required nonempty string, up to 120 characters), `limit` (optional, 1–50; default 20) | `name`, `phones` (`label`, `number`), `emails` |
-| `kehilanet.announcements.list` | `query` (optional string, up to 120 characters; default empty for latest), `limit` (optional, 1–20; default 10) | `id`, `title`, `date`, `category`, `teaser`, `content`, `links` |
+| `kehilanet.announcements.list` | `query` (optional string, up to 120 characters; default empty for latest), `limit` (optional, 1–20; default 10), `forum_id` (optional positive decimal category ID), `page` (optional, 1–100; default 1) | `id`, `title`, `date`, `category`, `teaser`, `content`, `links`, `has_image` |
+| `kehilanet.announcements.categories` | `{}` | `id`, `name` |
 
 For example, send `{"verb":"kehilanet.announcements.list","args":{"query":"ישיבה","limit":5}}`.
 Both return the standard command result with `payload.items` and
 `payload.total`. Announcement `content` and HTTPS `links` come from the full
-message view, rather than only its teaser. The portal is read through a local
+message view, rather than only its teaser. An image-only message has empty
+`content` and `has_image: true`; this API does not transcribe its image. The portal is read through a local
 headless Chrome session because a plain HTTP login did not reliably reach the
 member announcements page. The service performs no Kehila-Net writes.
+
+The latest announcements view is capped at 20; the portal ignores `page` there,
+so the API rejects `page > 1` without `forum_id`. For older items, call
+`kehilanet.announcements.categories`, then call `kehilanet.announcements.list`
+with that `forum_id` and successive `page` values. Category pages always
+return their full 20-item page so advancing pages does not skip results.
+The result also includes `payload.page` and `payload.forum_id`. The portal has
+no date-filter control; use each item's `date` while traversing the relevant
+category pages. Search uses the portal's `searchTXT` form.
 
 Set `KEHILANET_USERNAME` and `KEHILANET_PASSWORD` only in the owner-only
 `.env.local`; they are never accepted in request bodies. Member directory and

@@ -123,6 +123,26 @@ class KehilaPhonebookArgs(StrictModel):
 class KehilaAnnouncementsArgs(StrictModel):
     query: str = Field(default="", max_length=120)
     limit: int = Field(default=10, ge=1, le=20)
+    forum_id: str | None = None
+    page: int = Field(default=1, ge=1, le=100)
+
+    @field_validator("forum_id")
+    @classmethod
+    def validate_forum_id(cls, value: str | None) -> str | None:
+        if value is not None and (not re.fullmatch(r"[0-9]{1,32}", value) or int(value) == 0):
+            raise ValueError("forum_id must be a positive decimal ID")
+        return value
+
+    @model_validator(mode="after")
+    def validate_page_scope(self) -> "KehilaAnnouncementsArgs":
+        if self.page > 1 and self.forum_id is None:
+            raise ValueError("older pages require forum_id")
+        if self.forum_id is not None:
+            if "limit" not in self.model_fields_set:
+                self.limit = 20
+            elif self.limit != 20:
+                raise ValueError("category pages must return the complete 20-item page")
+        return self
 
 
 class TransactionsListArgs(StrictModel):
@@ -290,6 +310,11 @@ class KehilaAnnouncementsCommand(_CommandBase):
     args: KehilaAnnouncementsArgs
 
 
+class KehilaCategoriesCommand(_CommandBase):
+    verb: Literal["kehilanet.announcements.categories"]
+    args: EmptyArgs
+
+
 class TransactionsListCommand(_CommandBase):
     verb: Literal["transactions.list"]
     args: TransactionsListArgs
@@ -401,6 +426,7 @@ Command = Annotated[
         RecipientsSearchCommand,
         KehilaPhonebookCommand,
         KehilaAnnouncementsCommand,
+        KehilaCategoriesCommand,
         TransactionsListCommand,
         ApprovalsPendingCommand,
         AuthorizedUsersListCommand,
@@ -441,6 +467,7 @@ VERBS: Mapping[str, VerbSpec] = MappingProxyType(
         "recipients.search": VerbSpec("read", RecipientSearchArgs),
         "kehilanet.phonebook.search": VerbSpec("read", KehilaPhonebookArgs),
         "kehilanet.announcements.list": VerbSpec("read", KehilaAnnouncementsArgs),
+        "kehilanet.announcements.categories": VerbSpec("read", EmptyArgs),
         "transactions.list": VerbSpec("read", TransactionsListArgs),
         "approvals.pending": VerbSpec("read", EmptyArgs),
         "authorized_users.list": VerbSpec("read", EmptyArgs),
@@ -709,8 +736,10 @@ class KehilaNetDriverProtocol(Protocol):
         self, username: str, password: str, *, query: str, limit: int
     ) -> list[dict[str, Any]]: ...
     async def list_announcements(
-        self, username: str, password: str, *, query: str, limit: int
+        self, username: str, password: str, *, query: str, limit: int,
+        forum_id: str | None, page: int,
     ) -> list[dict[str, Any]]: ...
+    async def list_categories(self, username: str, password: str) -> list[dict[str, Any]]: ...
 
 
 async def dispatch_command(
@@ -884,9 +913,16 @@ async def _invoke_driver(
         portal, portal_username, portal_password = _require_kehilanet_dependencies(
             kehilanet_driver, kehilanet_username, kehilanet_password
         )
-        return _list_payload(await portal.list_announcements(
-            portal_username, portal_password, query=args.query, limit=args.limit
+        result = _list_payload(await portal.list_announcements(
+            portal_username, portal_password, query=args.query, limit=args.limit,
+            forum_id=args.forum_id, page=args.page,
         ))
+        return {**result, "page": args.page, "forum_id": args.forum_id}
+    if isinstance(command, KehilaCategoriesCommand):
+        portal, portal_username, portal_password = _require_kehilanet_dependencies(
+            kehilanet_driver, kehilanet_username, kehilanet_password
+        )
+        return _list_payload(await portal.list_categories(portal_username, portal_password))
     if isinstance(command, TransactionsListCommand):
         items = await driver.get_transactions(
             username,

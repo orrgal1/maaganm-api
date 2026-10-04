@@ -23,6 +23,7 @@ _DETAIL_PATH = "/forum/files/ViewMessage.asp"
 _MAX_RESPONSE_BYTES = 2 * 1024 * 1024
 _MAX_CONTACTS = 500
 _MAX_ANNOUNCEMENTS = 20
+_MAX_FORUM_PAGE = 100
 _TIMEOUT_MS = 20_000
 _EMAIL_RE = re.compile(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", re.I)
 _HTTPS_RE = re.compile(r"https://[^\s<>\"']+", re.I)
@@ -116,7 +117,7 @@ def _detail_identity(onclick: str) -> tuple[str, str]:
         raise _invalid_page()
     query = parse_qs(parsed.query, keep_blank_values=True)
     if not {"forum_id", "msgID"}.issubset(query) or set(query) - {
-        "forum_id", "msgID", "searchTXT"
+        "forum_id", "msgID", "searchTXT", "page"
     }:
         raise _invalid_page()
     forum_id, message_id = query["forum_id"], query["msgID"]
@@ -125,12 +126,65 @@ def _detail_identity(onclick: str) -> tuple[str, str]:
         or len(message_id) != 1
         or not re.fullmatch(r"[0-9]{1,32}", forum_id[0])
         or not re.fullmatch(r"[0-9]{1,32}", message_id[0])
+        or ("page" in query and (
+            len(query["page"]) != 1
+            or not re.fullmatch(r"[0-9]{1,32}", query["page"][0])
+        ))
     ):
         raise _invalid_page()
     return forum_id[0], message_id[0]
 
 
-def _announcement_cards(soup: BeautifulSoup, limit: int) -> list[dict[str, Any]]:
+def _forum_categories(
+    soup: BeautifulSoup, origin: tuple[str, str | None, int | None]
+) -> list[dict[str, str]]:
+    lists = soup.select("#forumList")
+    if len(lists) != 1 or lists[0].name != "div":
+        raise _invalid_page()
+    entries = lists[0].find_all(recursive=False)
+    if not entries or any(entry.name != "p" for entry in entries):
+        raise _invalid_page()
+    categories: list[dict[str, str]] = []
+    seen: set[str] = set()
+    latest_links = 0
+    for entry in entries:
+        links = entry.find_all(recursive=False)
+        if len(links) != 1 or links[0].name != "a":
+            raise _invalid_page()
+        link = links[0]
+        name = _text(link)
+        if not name or not link.has_attr("href"):
+            raise _invalid_page()
+        try:
+            parsed = urlsplit(link["href"])
+            if parsed.netloc:
+                if (parsed.scheme, parsed.hostname, parsed.port) != origin or parsed.username or parsed.password:
+                    raise _invalid_page()
+            elif parsed.scheme:
+                raise _invalid_page()
+            query = parse_qs(parsed.query, keep_blank_values=True)
+        except ValueError:
+            raise _invalid_page() from None
+        if parsed.path.lower() != _ANNOUNCEMENTS_PATH.lower() or parsed.fragment:
+            raise _invalid_page()
+        if query == {"last": ["1"], "target": ["1"]}:
+            latest_links += 1
+            continue
+        if set(query) != {"forumid"} or len(query["forumid"]) != 1:
+            raise _invalid_page()
+        forum_id = query["forumid"][0]
+        if not re.fullmatch(r"[0-9]{1,32}", forum_id) or forum_id in seen:
+            raise _invalid_page()
+        seen.add(forum_id)
+        categories.append({"id": forum_id, "name": name})
+    if latest_links != 1 or not categories:
+        raise _invalid_page()
+    return categories
+
+
+def _announcement_cards(
+    soup: BeautifulSoup, limit: int, *, category_name: str | None = None
+) -> list[dict[str, Any]]:
     cards = soup.select(".featuresItem.section")
     if not cards:
         # The forum keeps its search form when a valid search finds no cards.
@@ -148,13 +202,13 @@ def _announcement_cards(soup: BeautifulSoup, limit: int) -> list[dict[str, Any]]
         direct_links = card.find_all("a", recursive=False)
         dates = card.find_all("span", recursive=False)
         teaser = card.find("p", recursive=False)
-        if title_link is None or len(direct_links) < 2 or not dates or teaser is None:
+        if title_link is None or len(direct_links) < (1 if category_name else 2) or not dates or teaser is None:
             raise _invalid_page()
         forum_id, message_id = _detail_identity(title_link.get("onclick", ""))
         item_id = f"{forum_id}:{message_id}"
         title = _text(title_link)
         date = _text(dates[0])
-        category = _text(direct_links[1])
+        category = category_name if category_name is not None else _text(direct_links[1])
         if not item_id or not title or not date or not category or item_id in seen:
             raise _invalid_page()
         seen.add(item_id)
@@ -167,6 +221,7 @@ def _announcement_cards(soup: BeautifulSoup, limit: int) -> list[dict[str, Any]]
                 "teaser": _text(teaser),
                 "content": "",
                 "links": [],
+                "has_image": False,
             }
         )
         if len(items) >= limit:
@@ -174,13 +229,14 @@ def _announcement_cards(soup: BeautifulSoup, limit: int) -> list[dict[str, Any]]
     return items
 
 
-def _announcement_detail(soup: BeautifulSoup) -> tuple[str, list[str]]:
+def _announcement_detail(soup: BeautifulSoup) -> tuple[str, list[str], bool]:
     cells = soup.select("td.dont-break-out")
     if len(cells) != 1:
         raise _invalid_page()
     cell = cells[0]
     content = "\n".join(part.strip() for part in cell.stripped_strings if part.strip())
-    if not content:
+    has_image = cell.find("img", src=True) is not None
+    if not content and not has_image:
         raise _invalid_page()
     candidates = [anchor.get("href", "") for anchor in cell.find_all("a", href=True)]
     candidates.extend(_HTTPS_RE.findall(content))
@@ -190,7 +246,7 @@ def _announcement_detail(soup: BeautifulSoup) -> tuple[str, list[str]]:
         parsed = urlsplit(value)
         if parsed.scheme.lower() == "https" and parsed.netloc and value not in links:
             links.append(value)
-    return content, links
+    return content, links, has_image
 
 
 class KehilaNetDriver:
@@ -227,28 +283,63 @@ class KehilaNetDriver:
                 raise _error("kehilanet_unavailable", "The member service is unavailable.") from None
 
     async def list_announcements(
-        self, username: str, password: str, *, query: str = "", limit: int = 10
+        self, username: str, password: str, *, query: str = "", limit: int = 10,
+        forum_id: str | None = None, page: int = 1,
     ) -> list[dict[str, Any]]:
         _validate_query_limit(query, limit, _MAX_ANNOUNCEMENTS)
+        if (
+            (forum_id is not None and (not isinstance(forum_id, str) or not re.fullmatch(r"[0-9]{1,32}", forum_id)))
+            or isinstance(page, bool)
+            or not isinstance(page, int)
+            or not 1 <= page <= _MAX_FORUM_PAGE
+            or (forum_id is None and page != 1)
+        ):
+            raise APIException(400, "kehilanet_invalid_input", "Invalid member page request.")
         async with self._lock:
             try:
                 await self._ensure_session(username, password)
-                parameters = {"last": "1", "target": "1", "counterrefferer": "top_menu"}
+                parameters = (
+                    {"last": "1", "target": "1", "counterrefferer": "top_menu"}
+                    if forum_id is None else {"forumid": forum_id, "page": str(page)}
+                )
                 if query:
                     parameters["searchTXT"] = query
                 soup = await self._get_authenticated_html(
                     username, password, _ANNOUNCEMENTS_PATH + "?" + _query_string(parameters)
                 )
-                items = _announcement_cards(soup, limit)
+                category_name = None
+                if forum_id is not None:
+                    category_name = next(
+                        (entry["name"] for entry in _forum_categories(soup, self._origin)
+                         if entry["id"] == forum_id),
+                        None,
+                    )
+                    if category_name is None:
+                        raise _invalid_page()
+                items = _announcement_cards(soup, limit, category_name=category_name)
                 for item in items:
                     forum_id, message_id = item["id"].split(":", 1)
                     detail_path = _DETAIL_PATH + "?" + urlencode(
                         {"forum_id": forum_id, "msgID": message_id}
                     )
-                    item["content"], item["links"] = _announcement_detail(
+                    item["content"], item["links"], item["has_image"] = _announcement_detail(
                         await self._get_authenticated_html(username, password, detail_path)
                     )
                 return items
+            except APIException:
+                raise
+            except Exception:
+                raise _error("kehilanet_unavailable", "The member service is unavailable.") from None
+
+    async def list_categories(self, username: str, password: str) -> list[dict[str, str]]:
+        async with self._lock:
+            try:
+                await self._ensure_session(username, password)
+                soup = await self._get_authenticated_html(
+                    username, password,
+                    _ANNOUNCEMENTS_PATH + "?last=1&target=1&counterrefferer=top_menu",
+                )
+                return _forum_categories(soup, self._origin)
             except APIException:
                 raise
             except Exception:

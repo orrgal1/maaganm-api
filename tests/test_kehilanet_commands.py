@@ -22,11 +22,19 @@ class FakeKehilaNet:
         self.calls += 1
         return [{"name": "Or", "phones": [{"label": "mobile", "number": "0500000000"}], "emails": []}]
 
-    async def list_announcements(self, username, password, *, query, limit):
+    async def list_announcements(self, username, password, *, query, limit, forum_id, page):
         assert (username, password) == ("member-user", "member-password")
-        assert (query, limit) == ("meeting", 1)
+        assert (query, limit, forum_id, page) in {
+            ("meeting", 1, None, 1),
+            ("", 20, "123", 2),
+        }
         self.calls += 1
         return [{"id": "1:2", "title": "Meeting", "date": "01/01/2026", "category": "Notice", "teaser": "Meeting", "content": "Notice", "links": []}]
+
+    async def list_categories(self, username, password):
+        assert (username, password) == ("member-user", "member-password")
+        self.calls += 1
+        return [{"id": "123", "name": "Notices"}]
 
     async def close(self):
         pass
@@ -45,7 +53,7 @@ def test_kehilanet_live_reads_are_private_and_validated(tmp_path, monkeypatch):
     monkeypatch.setattr(http_api, "kehilanet_driver", fake)
     headers = {"Authorization": "Bearer test-bearer"}
 
-    assert {"kehilanet.phonebook.search", "kehilanet.announcements.list"} <= READ_VERBS
+    assert {"kehilanet.phonebook.search", "kehilanet.announcements.list", "kehilanet.announcements.categories"} <= READ_VERBS
     with TestClient(http_api.app) as client:
         request = {"id": "same-id", "verb": "kehilanet.phonebook.search", "args": {"query": "Or", "limit": 2}}
         assert client.post("/commands", json=request).status_code == 401
@@ -61,6 +69,23 @@ def test_kehilanet_live_reads_are_private_and_validated(tmp_path, monkeypatch):
         })
         assert announcements.status_code == 200
         assert announcements.json()["payload"]["items"][0]["title"] == "Meeting"
+        categories = client.post("/commands", headers=headers, json={
+            "verb": "kehilanet.announcements.categories", "args": {},
+        })
+        assert categories.status_code == 200
+        assert categories.json()["payload"]["items"] == [{"id": "123", "name": "Notices"}]
+        category_page = client.post("/commands", headers=headers, json={
+            "verb": "kehilanet.announcements.list", "args": {"forum_id": "123", "page": 2},
+        })
+        assert category_page.status_code == 200
+        assert category_page.json()["payload"]["page"] == 2
+        assert category_page.json()["payload"]["forum_id"] == "123"
+        assert client.post("/commands", headers=headers, json={
+            "verb": "kehilanet.announcements.list", "args": {"page": 2},
+        }).status_code == 400
+        assert client.post("/commands", headers=headers, json={
+            "verb": "kehilanet.announcements.list", "args": {"forum_id": "123", "limit": 5},
+        }).status_code == 400
         assert client.post("/commands", headers=headers, json={
             "verb": "kehilanet.phonebook.search", "args": {"query": ""},
         }).status_code == 400
