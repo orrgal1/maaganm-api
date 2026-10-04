@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 from urllib.parse import parse_qs, urlsplit
 
@@ -151,6 +152,17 @@ def test_image_only_announcement_is_valid_but_empty_body_is_not():
         _announcement_detail(html('<td class="dont-break-out"></td>'))
 
 
+def test_empty_announcement_body_in_full_detail_layout_is_valid():
+    source = (
+        '<div class="featuresItem section content"><table><tr>'
+        '<td class="dont-break-out"></td>'
+        '</tr></table></div>'
+    )
+    assert _announcement_detail(html(source)) == ("", [], False)
+    with pytest.raises(APIException):
+        _announcement_detail(html(source.replace("featuresItem section content", "other")))
+
+
 def test_empty_forum_search_is_valid_but_login_or_unsafe_detail_is_not():
     assert _announcement_cards(html('<form><input name="searchTXT"></form>'), 5) == []
     assert _announcement_cards(
@@ -179,6 +191,12 @@ def test_categories_parse_only_forum_menu_links_on_expected_origin():
     )
     assert len(_forum_categories(html(same_origin), ORIGIN)) == 2
 
+    with_count = CATEGORIES.replace(
+        '<p><a href="/forum/forum/start.asp?forumid=123">Community</a></p>',
+        '<p><a href="/forum/forum/start.asp?forumid=123">Community</a><span>2</span></p>',
+    )
+    assert _forum_categories(html(with_count), ORIGIN)[0] == {"id": "123", "name": "Community"}
+
 
 @pytest.mark.parametrize("source", [
     '<form><input name="password"></form>',
@@ -189,6 +207,7 @@ def test_categories_parse_only_forum_menu_links_on_expected_origin():
     CATEGORIES.replace('/forum/forum/start.asp?forumid=123', '/forum/files/ViewMessage.asp?forumid=123'),
     CATEGORIES.replace('/forum/forum/start.asp?forumid=123', 'https://elsewhere.invalid/forum/forum/start.asp?forumid=123'),
     CATEGORIES.replace('<p><a href="/forum/forum/start.asp?forumid=123">Community</a></p>', '<p>Community</p>'),
+    CATEGORIES.replace('<p><a href="/forum/forum/start.asp?forumid=123">Community</a></p>', '<p><a href="/forum/forum/start.asp?forumid=123">Community</a><span><b>2</b></span></p>'),
 ])
 def test_categories_reject_changed_or_unsafe_layout(source):
     with pytest.raises(APIException) as raised:
@@ -289,6 +308,42 @@ async def test_expired_session_reauthenticates_once(monkeypatch):
     monkeypatch.setattr(driver, "_get_html", fetch)
     contacts = await driver.search_phonebook("user", "password", query="", limit=1)
     assert len(contacts) == 1
+    assert ensure.await_count == 2
+    assert close.await_count == 1
+    assert fetch.await_count == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path,body", [
+    ("/familytree/personlist.asp?print=1", b"<script></script><script></script>"),
+    ("/forum/forum/start.asp?last=1", b"<html><body><div></div></body></html>"),
+    ("/forum/files/ViewMessage.asp?forum_id=123&msgID=456", b"<html><body><div></div></body></html>"),
+])
+async def test_expired_page_at_original_path_triggers_reauthentication(path, body):
+    driver = KehilaNetDriver()
+    response = SimpleNamespace(
+        url="https://www.maaganmk.co.il" + path,
+        status=200,
+        headers={"content-type": "text/html"},
+        body=AsyncMock(return_value=body),
+    )
+    driver._context = SimpleNamespace(request=SimpleNamespace(get=AsyncMock(return_value=response)))
+    with pytest.raises(_SessionExpired):
+        await driver._get_html(path)
+
+
+@pytest.mark.asyncio
+async def test_second_expired_page_fails_as_invalid_response(monkeypatch):
+    driver = KehilaNetDriver()
+    ensure = AsyncMock()
+    close = AsyncMock()
+    fetch = AsyncMock(side_effect=[_SessionExpired(), _SessionExpired()])
+    monkeypatch.setattr(driver, "_ensure_session", ensure)
+    monkeypatch.setattr(driver, "_close_unlocked", close)
+    monkeypatch.setattr(driver, "_get_html", fetch)
+    with pytest.raises(APIException) as raised:
+        await driver.search_phonebook("user", "password", query="", limit=1)
+    assert raised.value.code == "kehilanet_invalid_response"
     assert ensure.await_count == 2
     assert close.await_count == 1
     assert fetch.await_count == 2

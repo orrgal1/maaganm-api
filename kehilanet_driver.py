@@ -148,10 +148,14 @@ def _forum_categories(
     seen: set[str] = set()
     latest_links = 0
     for entry in entries:
-        links = entry.find_all(recursive=False)
-        if len(links) != 1 or links[0].name != "a":
+        children = entry.find_all(recursive=False)
+        if (
+            len(children) not in (1, 2)
+            or children[0].name != "a"
+            or (len(children) == 2 and (children[1].name != "span" or children[1].find(True)))
+        ):
             raise _invalid_page()
-        link = links[0]
+        link = children[0]
         name = _text(link)
         if not name or not link.has_attr("href"):
             raise _invalid_page()
@@ -237,7 +241,14 @@ def _announcement_detail(soup: BeautifulSoup) -> tuple[str, list[str], bool]:
     content = "\n".join(part.strip() for part in cell.stripped_strings if part.strip())
     has_image = cell.find("img", src=True) is not None
     if not content and not has_image:
-        raise _invalid_page()
+        container = cell.find_parent("div", class_="featuresItem")
+        if (
+            container is None
+            or not {"featuresItem", "section", "content"}.issubset(container.get("class", []))
+            or cell.parent.name != "tr"
+            or cell.parent.parent.name != "table"
+        ):
+            raise _invalid_page()
     candidates = [anchor.get("href", "") for anchor in cell.find_all("a", href=True)]
     candidates.extend(_HTTPS_RE.findall(content))
     links: list[str] = []
@@ -398,7 +409,10 @@ class KehilaNetDriver:
         except _SessionExpired:
             await self._close_unlocked()
             await self._ensure_session(username, password)
-            return await self._get_html(path)
+            try:
+                return await self._get_html(path)
+            except _SessionExpired:
+                raise _invalid_page() from None
 
     async def _get_html(self, path: str) -> BeautifulSoup:
         if self._context is None:
@@ -421,7 +435,19 @@ class KehilaNetDriver:
         body = await response.body()
         if len(body) > _MAX_RESPONSE_BYTES:
             raise _invalid_page()
-        return BeautifulSoup(body, "html.parser")
+        soup = BeautifulSoup(body, "html.parser")
+        requested_path = urlsplit(path).path.lower()
+        if requested_path == _PHONEBOOK_PATH.lower() and not soup.select("table#myTable"):
+            raise _SessionExpired()
+        if requested_path == _ANNOUNCEMENTS_PATH.lower() and not (
+            soup.select("#forumList")
+            or soup.select(".featuresItem.section")
+            or soup.select('form input[name="searchTXT"]')
+        ):
+            raise _SessionExpired()
+        if requested_path == _DETAIL_PATH.lower() and not soup.select("td.dont-break-out"):
+            raise _SessionExpired()
+        return soup
 
     async def close(self) -> None:
         async with self._lock:

@@ -39,7 +39,9 @@ For example, send `{"verb":"kehilanet.announcements.list","args":{"query":"יש�
 Both return the standard command result with `payload.items` and
 `payload.total`. Announcement `content` and HTTPS `links` come from the full
 message view, rather than only its teaser. An image-only message has empty
-`content` and `has_image: true`; this API does not transcribe its image. The portal is read through a local
+`content` and `has_image: true`; this API does not transcribe its image. The portal
+also has some announcements with an empty detail body, which return empty
+`content` and `has_image: false`. The portal is read through a local
 headless Chrome session because a plain HTTP login did not reliably reach the
 member announcements page. The service performs no Kehila-Net writes.
 
