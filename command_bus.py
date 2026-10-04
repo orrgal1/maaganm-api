@@ -1171,6 +1171,9 @@ def _safe_driver_message(code: str, *, is_help: bool = False, is_kehilanet: bool
         }.get(code, "The Kehila-Net read failed.")
     messages = {
         "invalid_credentials": "Budget credentials were rejected.",
+        "budget_authentication_unverified": "Budget authentication could not be verified.",
+        "budget_session_expired": "The Budget session could not be refreshed.",
+        "budget_response_invalid": "The Budget site returned an unexpected table page.",
         "upstream_error": (
             "The help service could not complete the operation."
             if is_help

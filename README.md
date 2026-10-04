@@ -24,6 +24,17 @@ fields:
 
 Completed Budget and help results replay only when both the request ID and locally configured Budget username match. This preserves safe replay of previously scoped requests for the same account. A request ID previously used by another username, or one created before account scoping was added, returns HTTP 409 with `Request ID is unavailable`; use a fresh ID. A retry with the same username can replay after a password change. Keep request IDs unique across those operations because an ID is never re-executed, even if its verb or arguments differ. Help commands use the locally provisioned `HELP_MEMBER_ID`.
 
+### Budget read sessions
+
+`GET /health` checks the local API process, not the Budget site's login. The
+`health` command probes that login. `transactions.list` and
+`approvals.pending` refresh an expired Budget session once and return an error
+if the response is still a login page or is not a recognized table. An `ok`
+result with zero items means the expected authenticated table was present and
+empty. If an earlier request ID replayed an empty result from before this
+validation, use a new request ID for a new read; never reuse an ID with
+different arguments.
+
 ### Transfer OTP step
 
 `transfer.stage` is a write command and requires its own unexpired `approval`.

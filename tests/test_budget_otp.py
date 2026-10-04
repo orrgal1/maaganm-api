@@ -20,6 +20,13 @@ def _table_row(*, status="Unapproved", can_approve="True"):
     return "<tr>" + "".join(f"<td>{value}</td>" for value in values) + "</tr>"
 
 
+def _transactions_table(rows=""):
+    return (
+        '<table id="transTable"><thead><tr>' + "<th>column</th>" * 11
+        + '</tr></thead><tbody>' + rows + "</tbody></table>"
+    )
+
+
 def _client(monkeypatch, driver, handler):
     client = httpx.AsyncClient(
         base_url="https://budget.example.invalid",
@@ -42,7 +49,7 @@ async def test_transactions_expose_site_approval_id_separately(monkeypatch):
     def handler(request):
         assert request.method == "GET"
         assert request.url.path == "/Budget/GetTransactionsTable"
-        return httpx.Response(200, text=_table_row())
+        return httpx.Response(200, text=_transactions_table(_table_row()))
 
     async with _client(monkeypatch, driver, handler):
         rows = await driver.get_transactions("user", "password")
@@ -61,7 +68,7 @@ async def test_request_otp_posts_only_the_observed_resend_field(monkeypatch):
     def handler(request):
         calls.append((request.method, request.url.path, request.content))
         if request.method == "GET":
-            return httpx.Response(200, text=_table_row())
+            return httpx.Response(200, text=_transactions_table(_table_row()))
         return httpx.Response(200, text="accepted")
 
     async with _client(monkeypatch, driver, handler):
@@ -116,7 +123,9 @@ async def test_approve_otp_requires_unique_confirmed_table_row(
             assert request.content == b"TransactionId=approval-1&Password=123456"
             return httpx.Response(200, text="generic page")
         assert request.url.path == "/Budget/GetTransactionsTable"
-        return httpx.Response(200, text=_table_row() if len(calls) == 1 else table_html)
+        return httpx.Response(
+            200, text=_transactions_table(_table_row() if len(calls) == 1 else table_html)
+        )
 
     async with _client(monkeypatch, driver, handler):
         result = await driver.approve_otp("user", "password", "approval-1", "123456")
@@ -148,7 +157,7 @@ async def test_otp_writes_reject_nonpending_or_ambiguous_row_before_post(
     def handler(request):
         calls.append((request.method, request.url.path))
         assert request.method == "GET"
-        return httpx.Response(200, text=table_html)
+        return httpx.Response(200, text=_transactions_table(table_html))
 
     async with _client(monkeypatch, driver, handler):
         for write in (

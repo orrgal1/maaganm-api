@@ -220,6 +220,7 @@ class BudgetDriver:
 
     def __init__(self):
         self._clients: Dict[str, httpx.AsyncClient] = {}
+        self._retired_clients: List[httpx.AsyncClient] = []
         self._cache_key_secret = os.urandom(32)
         self._lock = asyncio.Lock()
         self._recipients_cache: Dict[str, Tuple[float, List[Dict[str, Any]]]] = {}
@@ -301,10 +302,92 @@ class BudgetDriver:
                         "Accept-Language": "he-IL,he;q=0.9,en-US;q=0.8,en;q=0.7"
                     }
                 )
+                try:
+                    if not config.MOCK_MODE:
+                        await self._login_client(client, username, password)
+                except BaseException:
+                    await client.aclose()
+                    raise
                 self._clients[session_key] = client
-                if not config.MOCK_MODE:
-                    await self._login_client(client, username, password)
             return client
+
+    @staticmethod
+    def _is_login_response(resp: httpx.Response) -> bool:
+        if resp.url.path.rstrip("/").lower() == "/home/login":
+            return True
+        soup = BeautifulSoup(resp.text, "html.parser")
+        input_names = {
+            str(input_tag.get("name", "")).lower()
+            for input_tag in soup.find_all("input")
+        }
+        return {"username", "password"}.issubset(input_names)
+
+    async def _refresh_client(
+        self, username: str, password: str, stale_client: httpx.AsyncClient
+    ) -> httpx.AsyncClient:
+        session_key = self._session_key(username, password)
+        async with self._lock:
+            if self._clients.get(session_key) is stale_client:
+                self._clients.pop(session_key)
+                # Another in-flight operation may still be using this client.
+                # Retire it until shutdown instead of interrupting that request.
+                self._retired_clients.append(stale_client)
+        return await self.get_client(username, password)
+
+    async def _read_table(
+        self, username: str, password: str, path: str, *, params: dict | None = None
+    ) -> BeautifulSoup:
+        client = await self.get_client(username, password)
+        for attempt in range(2):
+            resp = await client.get(path, params=params)
+            if resp.status_code != 200:
+                raise APIException(
+                    status_code=502,
+                    code="upstream_error",
+                    message=f"Budget site returned HTTP {resp.status_code} during table read."
+                )
+            if self._is_login_response(resp):
+                if attempt == 0:
+                    client = await self._refresh_client(username, password, client)
+                    continue
+                raise APIException(
+                    status_code=502,
+                    code="budget_session_expired",
+                    message="Budget session could not be refreshed."
+                )
+            if resp.url.path != path:
+                raise APIException(
+                    status_code=502,
+                    code="budget_response_invalid",
+                    message="Budget site returned an unexpected table page."
+                )
+            return BeautifulSoup(resp.text, "html.parser")
+        raise AssertionError("unreachable")
+
+    @staticmethod
+    def _table_rows(soup: BeautifulSoup, table_id: str, header_count: int, row_columns: int):
+        table = soup.find("table", id=table_id)
+        head = table.find("thead", recursive=False) if table else None
+        body = table.find("tbody", recursive=False) if table else None
+        header_rows = head.find_all("tr", recursive=False) if head else []
+        if (
+            body is None
+            or len(header_rows) != 1
+            or len(header_rows[0].find_all("th", recursive=False)) != header_count
+        ):
+            raise APIException(
+                status_code=502,
+                code="budget_response_invalid",
+                message="Budget site returned an unrecognized table."
+            )
+        rows = body.find_all("tr", recursive=False)
+        if any(len(row.find_all("td", recursive=False)) < row_columns for row in rows):
+            raise APIException(
+                status_code=502,
+                code="budget_response_invalid",
+                message="Budget site returned an unrecognized table."
+            )
+        return rows
 
     def _session_key(self, username: str, password: str) -> str:
         credential_bytes = f"{len(username)}:{username}{password}".encode("utf-8")
@@ -335,6 +418,19 @@ class BudgetDriver:
                 status_code=502,
                 code="upstream_error",
                 message=f"Budget site returned HTTP {resp.status_code} during authentication."
+            )
+
+        if (
+            self._is_login_response(resp)
+            or resp.url.path != "/Budget/SendMoney"
+            or not BeautifulSoup(resp.text, "html.parser").find(
+                "form", action="/Home/Logout"
+            )
+        ):
+            raise APIException(
+                status_code=502,
+                code="budget_authentication_unverified",
+                message="Budget authentication could not be verified."
             )
 
         logger.info("Budget authentication succeeded.")
@@ -511,16 +607,10 @@ class BudgetDriver:
         t_date = to_date or now.strftime("%d/%m/%Y")
         t_types = types or "Regular,FromSavings,ToSavings,Charge,BulkCharge"
 
-        client = await self.get_client(username, password)
         data_param = f"{f_date}¥{t_date}¥{t_types}"
-        resp = await client.get("/Budget/GetTransactionsTable", params={"data": data_param})
-
-        if resp.status_code != 200:
-            raise APIException(
-                status_code=502,
-                code="upstream_error",
-                message=f"Failed to fetch transactions table (HTTP {resp.status_code})"
-            )
+        soup = await self._read_table(
+            username, password, "/Budget/GetTransactionsTable", params={"data": data_param}
+        )
 
         status_map = {
             "Executed": "בוצע",
@@ -531,9 +621,8 @@ class BudgetDriver:
             "Delayed": "מעוכב"
         }
 
-        soup = BeautifulSoup(resp.text, "html.parser")
         transactions = []
-        rows = soup.find_all("tr")
+        rows = self._table_rows(soup, "transTable", 11, 11)
         for r in rows:
             tds = r.find_all("td")
             if len(tds) >= 11:
@@ -1045,18 +1134,9 @@ class BudgetDriver:
         if config.MOCK_MODE:
             return self._mock_pending_approvals
 
-        client = await self.get_client(username, password)
-        resp = await client.get("/Budget/PendingApproval")
-        if resp.status_code != 200:
-            raise APIException(
-                status_code=502,
-                code="upstream_error",
-                message=f"Failed to fetch pending approvals (HTTP {resp.status_code})"
-            )
-
-        soup = BeautifulSoup(resp.text, "html.parser")
+        soup = await self._read_table(username, password, "/Budget/PendingApproval")
         items = []
-        rows = soup.find_all("tr")
+        rows = self._table_rows(soup, "transactions", 7, 5)
         for r in rows:
             tds = r.find_all("td")
             if len(tds) >= 5:
@@ -1192,8 +1272,9 @@ class BudgetDriver:
 
     async def close(self):
         """Closes all open HTTP clients."""
-        for client in self._clients.values():
+        for client in [*self._clients.values(), *self._retired_clients]:
             await client.aclose()
         self._clients.clear()
+        self._retired_clients.clear()
 
 budget_driver = BudgetDriver()
