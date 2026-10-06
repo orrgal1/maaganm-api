@@ -22,6 +22,26 @@ fields:
 
 `id` may be omitted to generate one, but callers should supply a stable ID for retries. `approval` is optional for reads and required for writes. Do not send Budget credentials in command bodies, arguments, URLs, or logs. The Budget driver uses the locally configured credentials and keeps authenticated sessions in memory.
 
+### Browser client
+
+From another machine, sign in at the gateway's `/login` page, then open
+`/maaganm-api/docs` on the same hostname. Swagger's **Try it out** sends
+`POST /maaganm-api/commands` through that gateway; it uses the browser session
+cookie, and the gateway adds the service bearer token. This is the supported
+browser UI for command JSON, including reads and writes. The gateway also
+accepts normal REST requests with the same authenticated browser session.
+Do not place credentials, OTP codes, transaction data, or bearer tokens in
+URLs or GitHub issues. The local service's own `/docs` on port 8001 is only
+reachable on this Mac.
+
+For each write, use a fresh `id` and an `approval` object with nonempty `ref`
+and future UTC `expires_at`, for example
+`{"ref":"<authorization reference>","expires_at":"<future UTC timestamp>"}`.
+The API checks this structure and expiry; the caller must ensure the reference
+actually records the account owner's authorization for that specific action.
+Never treat an earlier approval as permission to cancel, restage, or confirm a
+different transfer.
+
 Completed Budget and help results replay only when both the request ID and locally configured Budget username match. This preserves safe replay of previously scoped requests for the same account. A request ID previously used by another username, or one created before account scoping was added, returns HTTP 409 with `Request ID is unavailable`; use a fresh ID. A retry with the same username can replay after a password change. Keep request IDs unique across those operations because an ID is never re-executed, even if its verb or arguments differ. Help commands use the locally provisioned `HELP_MEMBER_ID`.
 
 ### Budget read sessions
@@ -61,6 +81,40 @@ form. Request or resend a code with `transfer.otp.request` when needed. Only
 call `transfer.approve` after you have its SMS code. Each OTP write needs its
 own unexpired `approval`; `otp_code` is the separate SMS verification code
 required by the budget service.
+
+### Cancel and replace a transfer
+
+Use a new `transactions.list` read first. For a row with `can_cancel: true`,
+`transaction.delete` accepts exactly
+`{"transaction_line_id":"<transactions.list.items[].transaction_id>"}`.
+This is the line ID, not `approval_transaction_id`. Give the cancellation its
+own request ID and approval. The driver confirms cancellation by re-reading
+that row; if it cannot confirm the state, it reports an unverified outcome and
+the caller must inspect a fresh `transactions.list` result before proceeding.
+The Budget site currently retains canceled rows in this list with status
+`מבוטל` when they are within the queried date range. A canceled row is history,
+not an active draft; do not delete it again.
+
+Only after the old transfer's cancellation is confirmed and the owner has
+explicitly authorized the replacement, use `transfer.stage` with
+`{"recipient_hid":"<recipient ID>","recipient_name":"<recipient name>","amount_ils":<positive number>}`.
+Optional `details_sender` and `details_receiver` are strings; the Budget form
+limits each to 20 characters. Put a note that should reappear in
+`transactions.list.items[].details` in `details_sender`: the read parser uses
+the sender note when present and falls back to the receiver note only when
+the sender note is empty. The merged read value cannot reveal which original
+field held an existing note, so use the owner's intended recipient-facing note
+in `details_receiver` separately if one is needed. `transaction_type` is fixed to `1` in this
+integration, and other values are rejected. `recipients.search` can supply the
+recipient ID and name. Staging is a write with a separate request ID and
+approval; if it returns `submission_unverified`, read transactions before any
+retry to avoid a duplicate transfer.
+
+If the replacement row is pending with `can_approve: true`, use its
+`approval_transaction_id` for `transfer.otp.request` as documented above, then
+pass that value as `transfer.approve.args.transaction_id` with the nonempty SMS
+code. Each step is a separate write requiring a fresh request ID and approval.
+Finally, verify the transaction status with another `transactions.list` read.
 
 ## Kehila-Net member reads
 
@@ -150,7 +204,7 @@ The driver mapping and command arguments are:
 | `help.call.schedule.replacements` | read | `get_schedule_replacements` | not required | exactly `{"call_id":"6457734"}` or `{"call_id":6457734}` |
 | `help.call.schedule.book` | write | `book_schedule` | required | exactly `{"call_id":"6457734","slot_id":"<nonempty string>"}` or the same object with integer `call_id` |
 | `help.call.schedule.move` | write | `move_schedule` | required | exactly `{"call_id":"6457734","slot_id":"<nonempty string>"}` or the same object with integer `call_id` |
-| `transfer.stage` | write | `transfer` | required | `recipient_hid`, `recipient_name`, `amount_ils`, `details_receiver` (optional), `details_sender` (optional), `transaction_type` (integer, optional; default 1) |
+| `transfer.stage` | write | `transfer` | required | `recipient_hid`, `recipient_name`, `amount_ils`, `details_receiver` (optional), `details_sender` (optional), `transaction_type` (optional; only `1`, the default) |
 | `transfer.otp.request` | write | `request_otp` | required | `approval_transaction_id` (nonempty ID from `transactions.list.approval_transaction_id`) |
 | `transfer.approve` | write | `approve_otp` | required | `transaction_id` (nonempty approval ID from a pending OTP stage or `transactions.list.approval_transaction_id`), `otp_code` (nonempty SMS code) |
 | `transaction.delete` | write | `cancel_transaction` | required | `transaction_line_id` |

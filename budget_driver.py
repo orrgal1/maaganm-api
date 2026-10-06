@@ -863,33 +863,46 @@ class BudgetDriver:
         password: str,
         transaction_line_id: str
     ) -> Dict[str, Any]:
-        """Cancels a pending or completed line transaction."""
+        """Cancel one currently cancellable line and verify its resulting state."""
+        rows = await self.get_transactions(username, password)
+        matches = [row for row in rows if row.get("transaction_id") == transaction_line_id]
+        if not matches:
+            raise APIException(404, "transaction_not_found", "Transaction line was not found in the current table.")
+        if len(matches) != 1:
+            raise APIException(409, "transaction_state_ambiguous", "Transaction line did not resolve to one row.")
+        if matches[0].get("can_cancel") is not True:
+            raise APIException(409, "transaction_not_cancellable", "Transaction line is not cancellable.")
+
         if config.MOCK_MODE:
-            self._mock_transactions = [
-                t for t in self._mock_transactions if t["transaction_id"] != transaction_line_id
-            ]
-            return {
-                "status": "cancelled",
-                "transaction_line_id": transaction_line_id,
-                "message": f"Transaction line {transaction_line_id} successfully cancelled."
-            }
-
-        client = await self.get_client(username, password)
-        resp = await client.request(
-            "DELETE",
-            f"/Budget/MyTransactions?transactionLineId={transaction_line_id}"
-        )
-        if resp.status_code != 200:
-            raise APIException(
-                status_code=502,
-                code="upstream_error",
-                message=f"Cancel request failed with HTTP {resp.status_code}"
+            matches[0]["status"] = "מבוטל"
+            matches[0]["can_cancel"] = False
+        else:
+            client = await self.get_client(username, password)
+            resp = await client.request(
+                "DELETE", "/Budget/MyTransactions", params={"transactionLineId": transaction_line_id}
             )
+            if resp.status_code != 200:
+                raise APIException(
+                    status_code=502,
+                    code="upstream_error",
+                    message=f"Cancel request failed with HTTP {resp.status_code}"
+                )
 
+        try:
+            current_rows = await self.get_transactions(username, password)
+        except Exception:
+            current_rows = []
+        current_matches = [
+            row for row in current_rows if row.get("transaction_id") == transaction_line_id
+        ]
+        confirmed = len(current_matches) == 1 and current_matches[0].get("status") == "מבוטל"
         return {
-            "status": "cancelled",
+            "status": "cancelled" if confirmed else "cancellation_unverified",
             "transaction_line_id": transaction_line_id,
-            "message": f"Transaction {transaction_line_id} cancelled."
+            "message": (
+                "The transaction table confirms cancellation."
+                if confirmed else "Cancellation outcome is unverified. Inspect transactions.list before retrying."
+            ),
         }
 
     def get_report_types(self) -> List[Dict[str, Any]]:

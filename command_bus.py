@@ -167,7 +167,7 @@ class TransferStageArgs(StrictModel):
     amount_ils: float = Field(gt=0)
     details_receiver: str = ""
     details_sender: str = ""
-    transaction_type: int = Field(default=1, ge=1)
+    transaction_type: Literal[1] = 1
 
 
 class TransferApproveArgs(StrictModel):
@@ -1183,6 +1183,9 @@ def _safe_driver_message(code: str, *, is_help: bool = False, is_kehilanet: bool
         "transfer_not_found": "The pending transfer was not found or has expired.",
         "transfer_not_approvable": "The transfer is not awaiting OTP approval.",
         "approval_state_ambiguous": "The transfer approval state could not be resolved safely.",
+        "transaction_not_found": "The transaction line was not found in the current table.",
+        "transaction_state_ambiguous": "The transaction line could not be resolved safely.",
+        "transaction_not_cancellable": "The transaction line is not cancellable.",
         "otp_verification_failed": "The transfer approval code was rejected.",
         "invalid_report_id": "The requested report is not supported.",
         "report_generation_failed": "The report could not be generated.",

@@ -189,6 +189,18 @@ def test_transfer_approve_requires_nonempty_otp_before_dispatch(tmp_path, monkey
     assert dispatched[0].approval.ref == "test-approval"
 
 
+def test_transfer_stage_rejects_unsupported_transaction_type(tmp_path, monkeypatch):
+    monkeypatch.setattr(http_api, "_store", RequestStore(tmp_path / "requests.sqlite3"))
+    args = {"recipient_hid": "recipient", "recipient_name": "Recipient", "amount_ils": 1.0}
+    with TestClient(http_api.app) as client:
+        response = client.post(
+            "/commands", headers=_headers(),
+            json={"id": str(uuid.uuid4()), "verb": "transfer.stage", "args": {**args, "transaction_type": 2}},
+        )
+    assert response.status_code == 400
+    assert response.json() == {"detail": "Invalid command or arguments"}
+
+
 def test_live_startup_requires_local_credentials(monkeypatch):
     monkeypatch.setattr(http_api.config, "MOCK_MODE", False)
     monkeypatch.setattr(http_api.config, "BUDGET_PASSWORD", "")
