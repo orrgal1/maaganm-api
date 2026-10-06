@@ -110,11 +110,13 @@ recipient ID and name. Staging is a write with a separate request ID and
 approval; if it returns `submission_unverified`, read transactions before any
 retry to avoid a duplicate transfer.
 
-If the replacement row is pending with `can_approve: true`, use its
-`approval_transaction_id` for `transfer.otp.request` as documented above, then
-pass that value as `transfer.approve.args.transaction_id` with the nonempty SMS
-code. Each step is a separate write requiring a fresh request ID and approval.
-Finally, verify the transaction status with another `transactions.list` read.
+If staging returns `pending_otp`, use the returned `transaction_id` and the SMS
+code for `transfer.approve`. For an existing pending row with `can_approve:
+true`, use its `approval_transaction_id` for `transfer.otp.request` only when a
+code must be requested or resent. Pass that approval ID as
+`transfer.approve.args.transaction_id` with the nonempty SMS code. Each write
+needs a fresh request ID and approval. Finally, verify the transaction status
+with another `transactions.list` read.
 
 ## Kehila-Net member reads
 
